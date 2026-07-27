@@ -58,6 +58,7 @@ type Client struct {
 	http  *http.Client
 	ua    string
 	clear *clearance.Manager
+	logf  func(string, ...any)
 
 	// rate limit gate
 	mu         sync.Mutex
@@ -91,7 +92,7 @@ func NewClient(proxy string, cm *clearance.Manager, baseCooldown time.Duration) 
 	}
 	c := &Client{
 		http: &http.Client{
-			Timeout:   45 * time.Second,
+			Timeout:   25 * time.Second,
 			Jar:       jar,
 			Transport: tr,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -107,6 +108,21 @@ func NewClient(proxy string, cm *clearance.Manager, baseCooldown time.Duration) 
 		c.ua = cm.UserAgent()
 	}
 	return c, nil
+}
+
+// SetLogger attaches optional progress logs (e.g. pipeline logx).
+func (c *Client) SetLogger(fn func(string, ...any)) {
+	if c == nil {
+		return
+	}
+	c.logf = fn
+}
+
+func (c *Client) log(format string, args ...any) {
+	if c == nil || c.logf == nil {
+		return
+	}
+	c.logf(format, args...)
 }
 
 func (c *Client) WaitRateLimit(ctx context.Context) error {
@@ -363,6 +379,7 @@ func authorizedBody(body string) bool {
 // Success only when device is actually marked authorized (done path / body text),
 // and a token probe does not immediately return invalid_grant.
 func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) error {
+	c.log("confirm start user_code=%s", strings.TrimSpace(flow.UserCode))
 	sso = strings.TrimSpace(sso)
 	if sso == "" {
 		return fmt.Errorf("login_required")
@@ -373,12 +390,20 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 		return fmt.Errorf("user_code empty")
 	}
 
+	// Bind bare SSO into accounts/auth session cookies first.
+	cookie = c.warmSSOSession(ctx, cookie)
+
 	// Warm verification page (accounts.x.ai or auth.x.ai complete URL).
 	referer := strings.TrimSpace(flow.VerificationURL)
 	if referer == "" {
 		referer = "https://accounts.x.ai/oauth2/device?user_code=" + url.QueryEscape(userCode)
 	}
-	_, _, _ = c.getWithCookie(ctx, referer, cookie)
+	if st, _, hdr, err := c.doGETCookie(ctx, referer, cookie); err == nil {
+		cookie = mergeSetCookies(cookie, hdr)
+		c.log("verify page warm status=%d url=%s", st, trimLoc(referer))
+	} else {
+		c.log("verify page warm fail: %v", err)
+	}
 
 	verifyURLs := []string{VerifyURLAccounts, VerifyURL}
 	approveURLs := []string{ApproveURLAccounts, ApproveURL}
@@ -394,6 +419,7 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	)
 	form := url.Values{"user_code": {userCode}}
 	for _, vURL := range verifyURLs {
+		c.log("verify POST %s", vURL)
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, vURL, strings.NewReader(form.Encode()))
 		if err != nil {
 			lastVerify = err
@@ -505,6 +531,7 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	}
 	for _, aURL := range approveURLs {
 		for fi, form := range forms {
+			c.log("approve POST %s form=%d", aURL, fi)
 			req2, err := http.NewRequestWithContext(ctx, http.MethodPost, aURL, strings.NewReader(form.Encode()))
 			if err != nil {
 				lastApprove = err
@@ -600,9 +627,10 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	return fmt.Errorf("device_approve_failed")
 }
 
-// ensureDeviceAuthorized probes the token endpoint once.
-// authorization_pending means confirm may still be propagating (OK for PollToken).
-// invalid_grant means Confirm was a false positive — treat as failure.
+// ensureDeviceAuthorized probes the token endpoint after approve.
+// invalid_grant/access_denied => confirm was a false positive.
+// authorization_pending is retried briefly; still-pending after the window fails confirm
+// so Exchange can start a fresh device code instead of hanging in PollToken for ExpiresIn.
 func (c *Client) ensureDeviceAuthorized(ctx context.Context, flow DeviceFlow) error {
 	if strings.TrimSpace(flow.DeviceCode) == "" || strings.TrimSpace(flow.TokenEndpoint) == "" {
 		// External device flows (CPA-managed) have no local device_code to probe.
@@ -614,43 +642,82 @@ func (c *Client) ensureDeviceAuthorized(ctx context.Context, flow DeviceFlow) er
 		return ctx.Err()
 	case <-time.After(800 * time.Millisecond):
 	}
-	form := url.Values{}
-	form.Set("client_id", ClientID)
-	form.Set("device_code", flow.DeviceCode)
-	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, flow.TokenEndpoint, strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", c.ua)
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	_ = resp.Body.Close()
-	var doc map[string]any
-	_ = json.Unmarshal(body, &doc)
-	if resp.StatusCode/100 == 2 {
-		// Token already issued — excellent.
-		return nil
-	}
-	errCode, _ := doc["error"].(string)
-	errDesc, _ := doc["error_description"].(string)
-	switch errCode {
-	case "authorization_pending", "slow_down":
-		return nil
-	case "invalid_grant", "access_denied":
-		if errDesc != "" {
-			return fmt.Errorf("confirm_not_accepted: %s (%s)", errCode, errDesc)
+
+	deadline := time.Now().Add(20 * time.Second)
+	interval := 2 * time.Second
+	var lastCode, lastDesc string
+	attempt := 0
+	for {
+		attempt++
+		form := url.Values{}
+		form.Set("client_id", ClientID)
+		form.Set("device_code", flow.DeviceCode)
+		form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, flow.TokenEndpoint, strings.NewReader(form.Encode()))
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("confirm_not_accepted: %s", errCode)
-	default:
-		// Unknown — let PollToken decide; don't fail confirm solely on probe noise.
-		return nil
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", c.ua)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		var doc map[string]any
+		_ = json.Unmarshal(body, &doc)
+		if resp.StatusCode/100 == 2 {
+			c.log("token probe ok attempt=%d (token already issued)", attempt)
+			return nil
+		}
+		errCode, _ := doc["error"].(string)
+		errDesc, _ := doc["error_description"].(string)
+		lastCode, lastDesc = errCode, errDesc
+		c.log("token probe attempt=%d status=%d error=%s desc=%s", attempt, resp.StatusCode, errCode, errDesc)
+		switch errCode {
+		case "authorization_pending", "slow_down":
+			if errCode == "slow_down" {
+				interval += time.Second
+			}
+		case "invalid_grant", "access_denied":
+			if errDesc != "" {
+				return fmt.Errorf("confirm_not_accepted: %s (%s)", errCode, errDesc)
+			}
+			return fmt.Errorf("confirm_not_accepted: %s", errCode)
+		case "expired_token":
+			return fmt.Errorf("confirm_not_accepted: expired_token")
+		default:
+			// Unknown — keep probing until deadline, then fail confirm.
+		}
+		if time.Now().Add(interval).After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(interval):
+		}
 	}
+	if lastCode == "authorization_pending" || lastCode == "slow_down" || lastCode == "" {
+		if lastDesc != "" {
+			return fmt.Errorf("confirm_not_accepted: still %s after approve (%s)", lastCodeOr(lastCode, "authorization_pending"), lastDesc)
+		}
+		return fmt.Errorf("confirm_not_accepted: still %s after approve", lastCodeOr(lastCode, "authorization_pending"))
+	}
+	if lastDesc != "" {
+		return fmt.Errorf("confirm_not_accepted: %s (%s)", lastCode, lastDesc)
+	}
+	return fmt.Errorf("confirm_not_accepted: %s", lastCode)
 }
+
+func lastCodeOr(code, fallback string) string {
+	if strings.TrimSpace(code) == "" {
+		return fallback
+	}
+	return code
+}
+
 // ConfirmVerificationURL authorizes a device flow created by another process,
 // such as CLIProxyAPI, while keeping the token exchange in that process.
 func (c *Client) ConfirmVerificationURL(ctx context.Context, sso, verificationURL string) error {
@@ -699,9 +766,15 @@ func mergeSetCookies(cookie string, h http.Header) string {
 }
 
 func (c *Client) getWithCookie(ctx context.Context, rawURL, cookie string) (int, string, error) {
+	st, body, _, err := c.doGETCookie(ctx, rawURL, cookie)
+	return st, body, err
+}
+
+// doGETCookie GETs a URL with Cookie header and returns status/body/response headers.
+func (c *Client) doGETCookie(ctx context.Context, rawURL, cookie string) (int, string, http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return 0, "", err
+		return 0, "", nil, err
 	}
 	req.Header.Set("User-Agent", c.ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -711,18 +784,43 @@ func (c *Client) getWithCookie(ctx context.Context, rawURL, cookie string) (int,
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, "", err
+		return 0, "", nil, err
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	_ = resp.Body.Close()
-	return resp.StatusCode, string(body), nil
+	return resp.StatusCode, string(body), resp.Header.Clone(), nil
+}
+
+// warmSSOSession hits accounts/auth roots so the IdP binds the bare SSO cookie
+// into a usable browser-like session before device verify/approve.
+func (c *Client) warmSSOSession(ctx context.Context, cookie string) string {
+	pages := []string{
+		"https://accounts.x.ai/",
+		"https://accounts.x.ai/sign-in",
+		"https://auth.x.ai/",
+	}
+	for _, p := range pages {
+		st, _, hdr, err := c.doGETCookie(ctx, p, cookie)
+		if err != nil {
+			c.log("sso warm fail url=%s err=%v", p, err)
+			continue
+		}
+		if hdr != nil {
+			cookie = mergeSetCookies(cookie, hdr)
+		}
+		c.log("sso warm ok url=%s status=%d", p, st)
+	}
+	return cookie
 }
 
 // loadConsentForm GETs consent page and extracts form fields (principal_id, csrf, etc.).
 func (c *Client) loadConsentForm(ctx context.Context, consentURL, cookie string) (url.Values, string) {
-	st, html, err := c.getWithCookie(ctx, consentURL, cookie)
+	st, html, hdr, err := c.doGETCookie(ctx, consentURL, cookie)
 	if err != nil || st >= 400 {
 		return nil, cookie
+	}
+	if hdr != nil {
+		cookie = mergeSetCookies(cookie, hdr)
 	}
 	fields := parseHTMLFormFields(html)
 	return fields, cookie
@@ -820,15 +918,36 @@ func (c *Client) setFormHeaders(req *http.Request, referer, cookie string) {
 }
 
 func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, error) {
-	deadline := time.Now().Add(time.Duration(flow.ExpiresIn) * time.Second)
+	// Default: honor device ExpiresIn (capped). Exchange uses pollTokenLimited after confirm.
+	return c.pollTokenLimited(ctx, flow, 0)
+}
+
+// pollTokenLimited polls the token endpoint until success, fatal error, or maxWait.
+// maxWait<=0 means use flow.ExpiresIn (capped at 3m) so a single attempt cannot hang 15m+.
+func (c *Client) pollTokenLimited(ctx context.Context, flow DeviceFlow, maxWait time.Duration) (Credential, error) {
+	exp := time.Duration(flow.ExpiresIn) * time.Second
 	if flow.ExpiresIn <= 0 {
-		deadline = time.Now().Add(10 * time.Minute)
+		exp = 3 * time.Minute
+	}
+	if exp > 3*time.Minute {
+		exp = 3 * time.Minute
+	}
+	deadline := time.Now().Add(exp)
+	if maxWait > 0 {
+		d2 := time.Now().Add(maxWait)
+		if d2.Before(deadline) {
+			deadline = d2
+		}
 	}
 	interval := time.Duration(flow.Interval * float64(time.Second))
 	if interval < time.Second {
 		interval = 5 * time.Second
 	}
+	c.log("poll token start max=%s interval=%s user_code=%s", time.Until(deadline).Round(time.Second), interval, strings.TrimSpace(flow.UserCode))
+	n := 0
+	var lastCode, lastDesc string
 	for time.Now().Before(deadline) {
+		n++
 		form := url.Values{}
 		form.Set("client_id", ClientID)
 		form.Set("device_code", flow.DeviceCode)
@@ -848,10 +967,15 @@ func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, er
 		var doc map[string]any
 		_ = json.Unmarshal(body, &doc)
 		if resp.StatusCode/100 == 2 {
+			c.log("poll token ok attempt=%d", n)
 			return credentialFrom(doc, flow.TokenEndpoint)
 		}
 		errCode, _ := doc["error"].(string)
 		errDesc, _ := doc["error_description"].(string)
+		lastCode, lastDesc = errCode, errDesc
+		if n == 1 || n%3 == 0 {
+			c.log("poll token attempt=%d error=%s desc=%s left=%s", n, errCode, errDesc, time.Until(deadline).Round(time.Second))
+		}
 		switch errCode {
 		case "authorization_pending":
 			// continue
@@ -862,7 +986,6 @@ func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, er
 		case "expired_token":
 			return Credential{}, fmt.Errorf("oauth_expired")
 		case "invalid_grant":
-			// Device not actually authorized (confirm incomplete / denied / SSO mismatch).
 			if errDesc != "" {
 				return Credential{}, fmt.Errorf("oauth_rejected: invalid_grant (%s) — device not authorized on auth.x.ai", errDesc)
 			}
@@ -882,90 +1005,12 @@ func (c *Client) PollToken(ctx context.Context, flow DeviceFlow) (Credential, er
 		case <-time.After(interval):
 		}
 	}
-	return Credential{}, fmt.Errorf("oauth_expired")
+	if lastDesc != "" {
+		return Credential{}, fmt.Errorf("oauth_pending_timeout: %s (%s)", lastCodeOr(lastCode, "authorization_pending"), lastDesc)
+	}
+	return Credential{}, fmt.Errorf("oauth_pending_timeout: %s", lastCodeOr(lastCode, "authorization_pending"))
 }
 
-func credentialFrom(doc map[string]any, endpoint string) (Credential, error) {
-	at, _ := doc["access_token"].(string)
-	rt, _ := doc["refresh_token"].(string)
-	if at == "" || rt == "" {
-		return Credential{}, fmt.Errorf("oauth_rejected: missing tokens")
-	}
-	id, _ := doc["id_token"].(string)
-	tt, _ := doc["token_type"].(string)
-	expF, _ := doc["expires_in"].(float64)
-	exp := int(expF)
-	if exp <= 0 {
-		exp = 3600
-	}
-	now := time.Now().UTC()
-	sub := jwtClaim(id, "sub")
-	if sub == "" {
-		sub = jwtClaim(at, "sub")
-	}
-	email := jwtClaim(id, "email")
-	if email == "" {
-		email = jwtClaim(at, "email")
-	}
-	return Credential{
-		AccessToken:   at,
-		RefreshToken:  rt,
-		IDToken:       id,
-		TokenType:     tt,
-		ExpiresIn:     exp,
-		ExpiresAt:     now.Add(time.Duration(exp) * time.Second).Format(time.RFC3339),
-		LastRefresh:   now.Format(time.RFC3339),
-		Subject:       sub,
-		TokenEndpoint: endpoint,
-		Email:         email,
-	}, nil
-}
-
-func jwtClaim(token, key string) string {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return ""
-	}
-	payload := parts[1]
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	raw, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
-		if err != nil {
-			return ""
-		}
-	}
-	var m map[string]any
-	if json.Unmarshal(raw, &m) != nil {
-		return ""
-	}
-	if v, ok := m[key].(string); ok {
-		return v
-	}
-	return ""
-}
-
-func truncateBody(b []byte, n int) string {
-	s := strings.TrimSpace(string(b))
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
-
-func trimLoc(s string) string {
-	if len(s) <= 120 {
-		return s
-	}
-	return s[:120] + "…"
-}
-
-// Refresh exchanges a refresh_token for a new access/refresh pair (no device confirm).
 func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
@@ -1019,10 +1064,13 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, 
 }
 
 // Exchange is convenience: start flow + confirm HTTP + poll.
-// On rate_limited / device 429 / invalid_grant / confirm_not_accepted, retry with a fresh device code.
+// On rate_limited / device 429 / invalid_grant / confirm_not_accepted / pending_timeout,
+// retry with a fresh device code. Post-confirm poll is capped so one attempt cannot hang
+// for the full device ExpiresIn (often 15m) and look "stuck" after → OAuth.
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	var last error
 	// Fresh SSO sessions sometimes need a short settle before device approve sticks.
+	c.log("exchange settle 1.5s (fresh SSO)")
 	select {
 	case <-ctx.Done():
 		return Credential{}, ctx.Err()
@@ -1031,11 +1079,14 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(attempt) * 2 * time.Second
+			c.log("exchange retry %d/5 backoff=%s last=%v", attempt+1, backoff, last)
 			select {
 			case <-ctx.Done():
 				return Credential{}, ctx.Err()
 			case <-time.After(backoff):
 			}
+		} else {
+			c.log("exchange attempt 1/5 start device flow")
 		}
 		if err := c.WaitRateLimit(ctx); err != nil {
 			return Credential{}, err
@@ -1043,6 +1094,7 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 		flow, err := c.StartDeviceFlow(ctx)
 		if err != nil {
 			last = err
+			c.log("device flow start fail: %v", err)
 			if errors.Is(err, ErrRateLimited) || strings.Contains(err.Error(), "status=429") {
 				continue
 			}
@@ -1051,8 +1103,10 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 			}
 			return Credential{}, err
 		}
+		c.log("device flow ok user_code=%s verify=%s expires_in=%d", flow.UserCode, trimLoc(flow.VerificationURL), flow.ExpiresIn)
 		if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
 			last = err
+			c.log("confirm fail: %v", err)
 			if errors.Is(err, ErrRateLimited) ||
 				strings.Contains(err.Error(), "challenge") ||
 				strings.Contains(err.Error(), "unknown_page") ||
@@ -1067,11 +1121,17 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 			}
 			return Credential{}, err
 		}
-		cred, err := c.PollToken(ctx, flow)
+		// Confirm looked good — only wait briefly for token propagation.
+		c.log("confirm ok, polling token (max 45s)…")
+		cred, err := c.pollTokenLimited(ctx, flow, 45*time.Second)
 		if err != nil {
 			last = err
-			// invalid_grant / access_denied: consent did not stick — new device flow
-			if strings.Contains(err.Error(), "invalid_grant") || strings.Contains(err.Error(), "access_denied") {
+			c.log("poll token fail: %v", err)
+			if strings.Contains(err.Error(), "invalid_grant") ||
+				strings.Contains(err.Error(), "access_denied") ||
+				strings.Contains(err.Error(), "oauth_denied") ||
+				strings.Contains(err.Error(), "oauth_pending_timeout") ||
+				strings.Contains(err.Error(), "confirm_not_accepted") {
 				continue
 			}
 			if attempt < 4 {
@@ -1079,6 +1139,7 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 			}
 			return Credential{}, err
 		}
+		c.log("exchange ok expires_in=%d", cred.ExpiresIn)
 		return cred, nil
 	}
 	if last == nil {
@@ -1086,3 +1147,4 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	}
 	return Credential{}, last
 }
+

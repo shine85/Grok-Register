@@ -398,6 +398,7 @@ func (e *Engine) run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	e.attachOAuthLogger()
 
 	_ = st.Set(func(s *state.Snapshot) {
 		s.Phase = state.PhaseRegister
@@ -468,6 +469,7 @@ func (e *Engine) run(ctx context.Context) error {
 	if e.cm != nil {
 		if oc, oerr := oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second); oerr == nil {
 			e.oauth = oc
+			e.attachOAuthLogger()
 		}
 	}
 	if err != nil {
@@ -906,6 +908,19 @@ func (e *Engine) waitOAuthSlot(ctx context.Context) error {
 	}
 }
 
+
+// attachOAuthLogger streams device-flow progress into pipeline logs so
+// "→ OAuth" is never a silent multi-minute black hole.
+func (e *Engine) attachOAuthLogger() {
+	if e == nil || e.oauth == nil || e.opt.Log == nil {
+		return
+	}
+	log := e.opt.Log
+	e.oauth.SetLogger(func(format string, args ...any) {
+		log.Infof("[oauth] "+format, args...)
+	})
+}
+
 func (e *Engine) oauthWorker(ctx context.Context, id int) {
 	defer e.wgOAuth.Done()
 	log := e.opt.Log
@@ -952,6 +967,7 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 			continue
 		}
 
+		log.Infof("[oauth] start local device exchange email=%s", job.Email)
 		cred, err := e.oauth.Exchange(ctx, job.SSO)
 		if err != nil {
 			log.Warnf("OAuth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
