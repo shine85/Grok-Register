@@ -105,6 +105,7 @@ func NewClient(proxy string, cm *clearance.Manager, baseCooldown time.Duration) 
 	c := &Client{
 		http:     cli,
 		ua:       DefaultUA,
+		proxy:    strings.TrimSpace(proxy),
 		clear:    cm,
 		baseCool: baseCooldown,
 		cooldown: baseCooldown,
@@ -373,6 +374,20 @@ func isDeviceDone(loc string) bool {
 	return strings.Contains(p, "/oauth2/device/done") || strings.HasSuffix(p, "/device/done")
 }
 
+// isDeviceConsentPath accepts only device consent/verify-related locations — never /account.
+func isDeviceConsentPath(loc string) bool {
+	if loc == "" {
+		return false
+	}
+	low := strings.ToLower(loc)
+	if strings.Contains(low, "/account") && !strings.Contains(low, "device") {
+		return false
+	}
+	return strings.Contains(low, "/oauth2/device") ||
+		strings.Contains(low, "/device/consent") ||
+		strings.Contains(low, "user_code=")
+}
+
 func isSignInRedirect(loc string) bool {
 	low := strings.ToLower(loc)
 	return strings.Contains(low, "/sign-in") ||
@@ -518,6 +533,11 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 		}
 		if isSignInRedirect(consentRef) {
 			lastVerify = fmt.Errorf("sso_rejected verify→%s", consentRef)
+			continue
+		}
+		if !isDeviceConsentPath(consentRef) {
+			lastVerify = fmt.Errorf("device_verify_not_consent status=%d loc=%s", resp.StatusCode, trimLoc(loc))
+			consentRef = ""
 			continue
 		}
 		lastVerify = nil
@@ -756,6 +776,57 @@ func lastCodeOr(code, fallback string) string {
 	}
 	return code
 }
+
+// probeTokenOnce does a single device_code token request.
+// Returns ("", nil) on success, ("authorization_pending"|"slow_down"|..., nil) on soft wait,
+// or ("", err) on hard failure.
+func (c *Client) probeTokenOnce(ctx context.Context, flow DeviceFlow) (string, error) {
+	if strings.TrimSpace(flow.DeviceCode) == "" || strings.TrimSpace(flow.TokenEndpoint) == "" {
+		return "", nil
+	}
+	form := url.Values{}
+	form.Set("client_id", ClientID)
+	form.Set("device_code", flow.DeviceCode)
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, flow.TokenEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", c.ua)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	_ = resp.Body.Close()
+	if resp.StatusCode/100 == 2 {
+		return "", nil
+	}
+	var doc map[string]any
+	_ = json.Unmarshal(body, &doc)
+	errCode, _ := doc["error"].(string)
+	errDesc, _ := doc["error_description"].(string)
+	switch errCode {
+	case "authorization_pending", "slow_down":
+		return errCode, nil
+	case "invalid_grant", "access_denied", "expired_token":
+		if errDesc != "" {
+			return errCode, fmt.Errorf("%s (%s)", errCode, errDesc)
+		}
+		return errCode, fmt.Errorf("%s", errCode)
+	default:
+		if errCode == "" {
+			return "unknown", fmt.Errorf("token status=%d body=%s", resp.StatusCode, truncateBody(body, 80))
+		}
+		if errDesc != "" {
+			return errCode, fmt.Errorf("%s (%s)", errCode, errDesc)
+		}
+		return errCode, fmt.Errorf("%s", errCode)
+	}
+}
+
+
 
 // ConfirmVerificationURL authorizes a device flow created by another process,
 // such as CLIProxyAPI, while keeping the token exchange in that process.
@@ -1192,7 +1263,13 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 			return Credential{}, err
 		}
 		c.log("device flow ok user_code=%s verify=%s expires_in=%d", flow.UserCode, trimLoc(flow.VerificationURL), flow.ExpiresIn)
-		if err := c.ConfirmHTTP(ctx, sso, flow); err != nil {
+		// accounts.x.ai device UX is a JS SPA — browser confirm is primary.
+		err = c.ConfirmBrowser(ctx, sso, flow)
+		if err != nil {
+			c.log("browser confirm fail: %v; fallback HTTP", err)
+			err = c.ConfirmHTTP(ctx, sso, flow)
+		}
+		if err != nil {
 			last = err
 			c.log("confirm fail: %v", err)
 			if errors.Is(err, ErrRateLimited) ||
@@ -1201,6 +1278,8 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 				strings.Contains(err.Error(), "device_verify") ||
 				strings.Contains(err.Error(), "device_approve") ||
 				strings.Contains(err.Error(), "confirm_not_accepted") ||
+				strings.Contains(err.Error(), "browser_confirm") ||
+				strings.Contains(err.Error(), "browser_navigate") ||
 				strings.Contains(err.Error(), "sso_rejected") {
 				continue
 			}
