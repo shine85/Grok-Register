@@ -1263,26 +1263,12 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 			return Credential{}, err
 		}
 		c.log("device flow ok user_code=%s verify=%s expires_in=%d", flow.UserCode, trimLoc(flow.VerificationURL), flow.ExpiresIn)
-		// accounts.x.ai device UX is a JS SPA — browser confirm is primary.
+		// accounts.x.ai device UX is a JS SPA — browser confirm ONLY.
+		// HTTP form fallback poisons device codes (307 /account, then invalid_grant).
 		err = c.ConfirmBrowser(ctx, sso, flow)
-		if err != nil {
-			c.log("browser confirm fail: %v; fallback HTTP", err)
-			err = c.ConfirmHTTP(ctx, sso, flow)
-		}
 		if err != nil {
 			last = err
 			c.log("confirm fail: %v", err)
-			if errors.Is(err, ErrRateLimited) ||
-				strings.Contains(err.Error(), "challenge") ||
-				strings.Contains(err.Error(), "unknown_page") ||
-				strings.Contains(err.Error(), "device_verify") ||
-				strings.Contains(err.Error(), "device_approve") ||
-				strings.Contains(err.Error(), "confirm_not_accepted") ||
-				strings.Contains(err.Error(), "browser_confirm") ||
-				strings.Contains(err.Error(), "browser_navigate") ||
-				strings.Contains(err.Error(), "sso_rejected") {
-				continue
-			}
 			if attempt < 2 {
 				continue
 			}

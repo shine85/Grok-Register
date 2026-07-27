@@ -1,8 +1,12 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,9 +17,12 @@ import (
 	"github.com/grok-free-register/grok-reg/internal/browser"
 )
 
-// ConfirmBrowser drives the accounts.x.ai device SPA with a real Chromium.
-// HTTP form posts only bounce to /account because verify/approve UX is client-side JS.
+// ConfirmBrowser drives the accounts.x.ai device SPA.
+// Primary: Playwright+CloakBrowser script (same stack as turnstile).
+// Fallback: chromedp against the same Chrome binary.
+// Pure HTTP form posts only 307 to /account and never bind the device_code.
 func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow) error {
+	c.log("browser confirm enter user_code=%s", strings.TrimSpace(flow.UserCode))
 	sso = strings.TrimSpace(sso)
 	if sso == "" {
 		return fmt.Errorf("login_required")
@@ -29,6 +36,166 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 		verifyURL = "https://accounts.x.ai/oauth2/device?user_code=" + userCode
 	}
 
+	// 1) Playwright script (preferred in Docker).
+	if err := c.confirmViaPlaywright(ctx, sso, verifyURL); err == nil {
+		if code, perr := c.probeTokenOnce(ctx, flow); perr == nil && code == "" {
+			c.log("browser confirm ok via playwright+token")
+			c.ClearRateLimit()
+			return nil
+		} else if perr != nil {
+			c.log("playwright UI ok but token hard err: %v", perr)
+			return perr
+		} else {
+			c.log("playwright UI ok, token soft=%s — settle probe", code)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+			}
+			if code2, perr2 := c.probeTokenOnce(ctx, flow); perr2 == nil && code2 == "" {
+				c.ClearRateLimit()
+				return nil
+			} else if perr2 != nil {
+				return perr2
+			}
+			c.log("playwright token still soft after settle; trying chromedp")
+		}
+	} else {
+		c.log("playwright device_auth fail: %v", err)
+	}
+
+	// 2) chromedp fallback
+	return c.confirmViaChromedp(ctx, sso, verifyURL, flow)
+}
+
+func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string) error {
+	py := findDeviceAuthPython()
+	script := findDeviceAuthScript()
+	if py == "" {
+		return fmt.Errorf("device_auth python not found (GROK_PYTHON)")
+	}
+	if script == "" {
+		return fmt.Errorf("device_auth.py not found (GROK_DEVICE_AUTH_SCRIPT)")
+	}
+	mode := strings.TrimSpace(os.Getenv("OAUTH_BROWSER_MODE"))
+	if mode == "" {
+		mode = "headless"
+	}
+	args := []string{
+		script,
+		"--url", verifyURL,
+		"--sso", sso,
+		"--timeout", "70",
+		"--mode", mode,
+	}
+	if strings.TrimSpace(c.proxy) != "" {
+		args = append(args, "--proxy", strings.TrimSpace(c.proxy))
+	}
+	if chrome := browser.FindChrome(); chrome != "" {
+		args = append(args, "--chrome", chrome)
+	}
+
+	bin := py
+	binArgs := args
+	if strings.EqualFold(mode, "offscreen") &&
+		strings.TrimSpace(os.Getenv("DISPLAY")) == "" &&
+		strings.TrimSpace(os.Getenv("WAYLAND_DISPLAY")) == "" {
+		if xvfb, err := exec.LookPath("xvfb-run"); err == nil {
+			bin = xvfb
+			binArgs = append([]string{"-a", py}, args...)
+		}
+	}
+
+	c.log("browser playwright py=%s script=%s mode=%s", bin, script, mode)
+	runCtx, cancel := context.WithTimeout(ctx, 80*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, bin, binArgs...)
+	cmd.Env = os.Environ()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	out := strings.TrimSpace(stdout.String())
+	errText := strings.TrimSpace(stderr.String())
+	if errText != "" {
+		for _, line := range strings.Split(errText, "
+") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			if len(line) > 220 {
+				line = line[:220] + "…"
+			}
+			c.log("device_auth | %s", line)
+		}
+	}
+	if err != nil {
+		if errText == "" {
+			errText = err.Error()
+		}
+		return fmt.Errorf("device_auth: %s", trimLoc(errText))
+	}
+	if !strings.Contains(strings.ToLower(out), "ok") {
+		return fmt.Errorf("device_auth: no ok in stdout (%s)", trimLoc(out+" "+errText))
+	}
+	return nil
+}
+
+func findDeviceAuthPython() string {
+	for _, name := range []string{
+		os.Getenv("GROK_PYTHON"),
+		"/opt/cloakbrowser-venv/bin/python",
+		"python3",
+		"python",
+	} {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if path, err := exec.LookPath(name); err == nil {
+			return path
+		}
+		if strings.Contains(name, string(os.PathSeparator)) || strings.Contains(name, "/") {
+			if st, err := os.Stat(name); err == nil && !st.IsDir() {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func findDeviceAuthScript() string {
+	if p := strings.TrimSpace(os.Getenv("GROK_DEVICE_AUTH_SCRIPT")); p != "" {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	var candidates []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(dir, "scripts", "device_auth.py"),
+			filepath.Join(dir, "device_auth.py"),
+			filepath.Join(dir, "..", "scripts", "device_auth.py"),
+		)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, "scripts", "device_auth.py"))
+	}
+	candidates = append(candidates,
+		"/usr/local/share/grok-reg/device_auth.py",
+		"/opt/Grok-Register/scripts/device_auth.py",
+	)
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, flow DeviceFlow) error {
 	execPath := browser.FindChrome()
 	if execPath == "" {
 		return fmt.Errorf("chrome/chromium not found for device confirm; set CHROME_PATH")
@@ -59,8 +226,7 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
 	defer tabCancel()
 
-	c.log("browser confirm start chrome=%s user_code=%s url=%s", execPath, userCode, trimLoc(verifyURL))
-
+	c.log("browser chromedp start chrome=%s url=%s", execPath, trimLoc(verifyURL))
 	stealth := "Object.defineProperty(navigator,\"webdriver\",{get:()=>undefined})"
 
 	if err := chromedp.Run(tabCtx,
@@ -85,6 +251,7 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	var lastURL string
 	probeEvery := 5 * time.Second
 	nextProbe := time.Now().Add(2 * time.Second)
+	bodyJS := "(document.body && (document.body.innerText||\"\") || \"\").slice(0,240)"
 
 	for time.Now().Before(deadline) {
 		select {
@@ -94,7 +261,6 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 		}
 
 		var href, bodySample, clicked string
-		bodyJS := "(document.body && (document.body.innerText||\"\") || \"\").slice(0,240)"
 		if err := chromedp.Run(tabCtx,
 			chromedp.Location(&href),
 			chromedp.Evaluate(deviceClickJS, &clicked),
@@ -109,15 +275,12 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 		}
 
 		if isDeviceDone(href) || authorizedBody(bodySample) {
-			c.log("browser UI success url=%s — probing token", trimLoc(href))
+			c.log("browser UI success url=%s", trimLoc(href))
 			if code, err := c.probeTokenOnce(ctx, flow); err == nil && code == "" {
 				c.ClearRateLimit()
 				return nil
 			} else if err != nil {
-				c.log("browser UI success hard token err: %v", err)
 				return err
-			} else {
-				c.log("browser UI success token soft=%s", code)
 			}
 		}
 
@@ -129,7 +292,6 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 				return nil
 			}
 			if err != nil {
-				c.log("browser token hard err: %v", err)
 				return err
 			}
 			c.log("browser token soft=%s url=%s last_click=%q", code, trimLoc(lastURL), lastClick)
