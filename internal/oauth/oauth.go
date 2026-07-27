@@ -286,6 +286,35 @@ func (c *Client) discover(ctx context.Context) (deviceEP, tokenEP string, err er
 }
 
 // principalFromSSO extracts user id from session SSO JWT for device approve form.
+func jwtClaim(token, key string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	payload := parts[1]
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	raw, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return ""
+		}
+	}
+	var m map[string]any
+	if json.Unmarshal(raw, &m) != nil {
+		return ""
+	}
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
 func principalFromSSO(sso string) string {
 	for _, key := range []string{"sub", "user_id", "userId", "uid", "id", "principal_id", "principalId"} {
 		if v := jwtClaim(sso, key); v != "" {
@@ -1148,3 +1177,53 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	return Credential{}, last
 }
 
+func credentialFrom(doc map[string]any, endpoint string) (Credential, error) {
+	at, _ := doc["access_token"].(string)
+	rt, _ := doc["refresh_token"].(string)
+	if at == "" || rt == "" {
+		return Credential{}, fmt.Errorf("oauth_rejected: missing tokens")
+	}
+	id, _ := doc["id_token"].(string)
+	tt, _ := doc["token_type"].(string)
+	expF, _ := doc["expires_in"].(float64)
+	exp := int(expF)
+	if exp <= 0 {
+		exp = 3600
+	}
+	now := time.Now().UTC()
+	sub := jwtClaim(id, "sub")
+	if sub == "" {
+		sub = jwtClaim(at, "sub")
+	}
+	email := jwtClaim(id, "email")
+	if email == "" {
+		email = jwtClaim(at, "email")
+	}
+	return Credential{
+		AccessToken:   at,
+		RefreshToken:  rt,
+		IDToken:       id,
+		TokenType:     tt,
+		ExpiresIn:     exp,
+		ExpiresAt:     now.Add(time.Duration(exp) * time.Second).Format(time.RFC3339),
+		LastRefresh:   now.Format(time.RFC3339),
+		Subject:       sub,
+		TokenEndpoint: endpoint,
+		Email:         email,
+	}, nil
+}
+
+func truncateBody(b []byte, n int) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+func trimLoc(s string) string {
+	if len(s) <= 120 {
+		return s
+	}
+	return s[:120] + "…"
+}
