@@ -3,6 +3,7 @@ package cpa
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ErrDeviceAuthDenied is returned when CPA /get-auth-status reports status=error
+// (for example xAI invalid_grant / Access denied).
+var ErrDeviceAuthDenied = errors.New("cpa device auth denied")
 
 type ManagementConfig struct {
 	BaseURL string
@@ -77,7 +82,13 @@ func (c *ManagementClient) StartXAIAuth(ctx context.Context) (DeviceAuth, error)
 	return DeviceAuth{URL: authURL, State: state, UserCode: userCode}, nil
 }
 
+// WaitAuth polls CPA /get-auth-status until status=ok, status=error, timeout, or ctx cancel.
 func (c *ManagementClient) WaitAuth(ctx context.Context, state string, interval, timeout time.Duration) error {
+	return c.WaitAuthNotify(ctx, state, interval, timeout, nil)
+}
+
+// WaitAuthNotify is WaitAuth with an optional status callback (status, attempt starting at 1).
+func (c *ManagementClient) WaitAuthNotify(ctx context.Context, state string, interval, timeout time.Duration, notify func(status string, attempt int)) error {
 	state = strings.TrimSpace(state)
 	if state == "" {
 		return fmt.Errorf("CPA auth state is empty")
@@ -91,20 +102,30 @@ func (c *ManagementClient) WaitAuth(ctx context.Context, state string, interval,
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	attempt := 0
 	for {
+		attempt++
 		var response struct {
 			Status string `json:"status"`
 			Error  string `json:"error"`
 		}
 		query := url.Values{"state": {state}}
 		if err := c.getJSON(waitCtx, "/get-auth-status", query, &response); err != nil {
+			if waitCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context")) {
+				return fmt.Errorf("wait for CPA xAI auth: %w", waitCtx.Err())
+			}
 			return err
 		}
-		switch strings.ToLower(strings.TrimSpace(response.Status)) {
+		status := strings.ToLower(strings.TrimSpace(response.Status))
+		if notify != nil {
+			notify(status, attempt)
+		}
+		switch status {
 		case "ok":
 			return nil
 		case "error":
-			return fmt.Errorf("CPA xAI auth failed: %s", responseError(response.Error, response.Status))
+			detail := responseError(response.Error, response.Status)
+			return fmt.Errorf("%w: %s", ErrDeviceAuthDenied, detail)
 		case "wait", "":
 		default:
 			return fmt.Errorf("CPA xAI auth returned unknown status %q", response.Status)

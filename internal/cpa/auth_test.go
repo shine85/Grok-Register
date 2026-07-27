@@ -3,6 +3,7 @@ package cpa
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -85,5 +86,27 @@ func TestManagementDeviceAuthRequiresUserCode(t *testing.T) {
 	client := NewManagementClient(ManagementConfig{BaseURL: srv.URL, Key: "k", Timeout: time.Second})
 	if _, err := client.StartXAIAuth(context.Background()); err == nil || !strings.Contains(err.Error(), "user_code") {
 		t.Fatalf("expected missing user_code error, got %v", err)
+	}
+}
+
+func TestManagementDeviceAuthDenied(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/get-auth-status") {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "invalid_grant: Access denied",
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	client := NewManagementClient(ManagementConfig{BaseURL: srv.URL, Key: "k", Timeout: time.Second})
+	err := client.WaitAuth(context.Background(), "st", time.Millisecond, time.Second)
+	if err == nil || !errors.Is(err, ErrDeviceAuthDenied) {
+		t.Fatalf("expected ErrDeviceAuthDenied, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "invalid_grant") {
+		t.Fatalf("error=%v", err)
 	}
 }

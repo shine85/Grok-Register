@@ -69,10 +69,15 @@ type Engine struct {
 	ssoN     atomic.Int64
 	oaN      atomic.Int64
 	fail     atomic.Int64
+	aborted  atomic.Bool
 
 	// Global OAuth pacing (shared by all oauth workers) — avoids dual-worker rate_limited.
 	oauthGateMu    sync.Mutex
 	oauthLastStart time.Time
+	cpaAuthMu      sync.Mutex // one human CPA device auth at a time
+
+	cancel    context.CancelFunc
+	abortOnce sync.Once
 
 	start    time.Time
 	wgReg    sync.WaitGroup // S/P/C
@@ -83,8 +88,15 @@ type Engine struct {
 
 // remainingCapacity = target - done - reserved (how many new accounts may start).
 func (e *Engine) remainingCapacity() int {
+	if e.aborted.Load() {
+		return 0
+	}
 	n := e.opt.Target - int(e.done.Load()) - int(e.reserved.Load())
 	if n < 0 {
+		return 0
+	}
+	// Manual CPA device approval: never pre-register a queue of accounts.
+	if e.cpaDeviceFlowEnabled(e.opt.Cfg) && e.reserved.Load() >= 1 {
 		return 0
 	}
 	return n
@@ -93,9 +105,16 @@ func (e *Engine) remainingCapacity() int {
 // tryReserve claims one pipeline seat for a new account attempt.
 func (e *Engine) tryReserve() bool {
 	for {
+		if e.aborted.Load() {
+			return false
+		}
 		d := e.done.Load()
 		r := e.reserved.Load()
 		if d+r >= int64(e.opt.Target) {
+			return false
+		}
+		// Keep CPA device flow to one in-flight account for human approval.
+		if e.cpaDeviceFlowEnabled(e.opt.Cfg) && r >= 1 {
 			return false
 		}
 		if e.reserved.CompareAndSwap(r, r+1) {
@@ -173,6 +192,18 @@ func (e *Engine) run(ctx context.Context) error {
 		tSlots, qSlots = cfg.Target, cfg.Target
 	}
 	e.inv = inventory.New[string, QItem](tSlots, qSlots)
+	if e.cpaDeviceFlowEnabled(cfg) {
+		// Manual device approval cannot keep up with parallel register burn.
+		if sWorkers != 1 || pWorkers != 1 || cWorkers != 1 || oauthWorkers != 1 {
+			log.Infof("CPA device flow serializes workers S/P/C/OAuth -> 1 (was S=%d P=%d C=%d OAuth=%d)", sWorkers, pWorkers, cWorkers, oauthWorkers)
+		}
+		sWorkers, pWorkers, cWorkers, oauthWorkers = 1, 1, 1, 1
+		physCap = 1
+		e.phys = inventory.NewSemaphore(1)
+		e.qPending = inventory.NewSemaphore(1)
+		e.inv = inventory.New[string, QItem](1, 1)
+		qPend, tSlots, qSlots = 1, 1, 1
+	}
 	log.Infof("workers S=%d P=%d C=%d OAuth=%d phys=%d q_pending=%d t/q_slots=%d", sWorkers, pWorkers, cWorkers, oauthWorkers, physCap, qPend, tSlots)
 
 	_ = st.Set(func(s *state.Snapshot) {
@@ -353,14 +384,14 @@ func (e *Engine) run(ctx context.Context) error {
 	}, func(f string, a ...any) {
 		log.Infof(f, a...)
 	})
-	if e.uploader.Enabled() {
-		log.Infof("CPA managed device auth enabled base=%s", cfg.CPAManagementBase)
-	}
 	e.cpaAuth = cpa.NewManagementClient(cpa.ManagementConfig{
 		BaseURL: cfg.CPAManagementBase,
 		Key:     cfg.CPAManagementKey,
 		Timeout: time.Duration(cfg.CPAUploadTimeoutSec) * time.Second,
 	})
+	if e.cpaDeviceFlowEnabled(cfg) {
+		log.Infof("CPA device flow enabled base=%s (manual authorize + poll /get-auth-status)", cpa.NormalizeManagementBase(cfg.CPAManagementBase))
+	}
 	e.oauth, err = oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second)
 	if err != nil {
 		return err
@@ -449,6 +480,7 @@ func (e *Engine) run(ctx context.Context) error {
 	log.OKf("注册服务已启动 | 目标 %d | run=%s | impersonate=%s", e.opt.Target, e.opt.Run.RunID, e.xai.Profile())
 
 	ctx, cancel := context.WithCancel(ctx)
+	e.cancel = cancel
 	defer cancel()
 
 	// signal
@@ -516,7 +548,11 @@ shutdown:
 	// 4) wait CPA management uploads (async; used to be killed on exit)
 	waitGroupTimeout(&e.wgReg, 15*time.Second, log, "register workers")
 	close(e.oauthCh)
-	waitGroupTimeout(&e.wgOAuth, 30*time.Second, log, "oauth workers")
+	oauthWait := 30 * time.Second
+	if e.cpaDeviceFlowEnabled(cfg) {
+		oauthWait = 12 * time.Minute
+	}
+	waitGroupTimeout(&e.wgOAuth, oauthWait, log, "oauth workers")
 	uploadWait := 90 * time.Second
 	if cfg.CPAUploadEnabled {
 		// timeout * (retries+1) + verify + margin
@@ -872,8 +908,8 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 	defer e.wgOAuth.Done()
 	log := e.opt.Log
 	for job := range e.oauthCh {
-		// Soft-stop: still drain with seat accounting, but skip work past target.
-		if int(e.done.Load()) >= e.opt.Target {
+		// Soft-stop: still drain with seat accounting, but skip work past target / abort.
+		if e.aborted.Load() || ctx.Err() != nil || int(e.done.Load()) >= e.opt.Target {
 			e.releaseReserve()
 			continue
 		}
@@ -891,11 +927,15 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		if len(ssoPrev) > 24 {
 			ssoPrev = ssoPrev[:12] + "…" + ssoPrev[len(ssoPrev)-8:]
 		}
-		if e.cpaAuth != nil && e.opt.Cfg.CPAUploadEnabled && e.cpaAuth.Enabled() {
+		if e.cpaDeviceFlowEnabled(e.opt.Cfg) {
 			if err := e.authorizeCPA(ctx, job); err != nil {
-				log.Warnf("CPA OAuth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
+				log.Warnf("CPA device auth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
 				e.fail.Add(1)
 				e.releaseReserve()
+				// Hard stop: do not keep burning emails after device auth failure.
+				if !e.aborted.Load() && ctx.Err() == nil {
+					e.abortRun(fmt.Errorf("CPA device auth failed for %s: %w", job.Email, err))
+				}
 				continue
 			}
 			e.oaN.Add(1)
@@ -973,19 +1013,114 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 	}
 }
 
+func (e *Engine) cpaDeviceFlowEnabled(cfg config.Config) bool {
+	if !cfg.CPAUploadEnabled {
+		return false
+	}
+	if e.cpaAuth != nil {
+		return e.cpaAuth.Enabled()
+	}
+	// Client may not be constructed yet during worker sizing.
+	return strings.TrimSpace(cfg.CPAManagementBase) != "" && strings.TrimSpace(cfg.CPAManagementKey) != ""
+}
+
+func (e *Engine) abortRun(err error) {
+	if err == nil {
+		return
+	}
+	e.abortOnce.Do(func() {
+		e.aborted.Store(true)
+		_ = e.opt.Store.Set(func(s *state.Snapshot) {
+			s.Status = state.StatusError
+			s.Error = err.Error()
+			s.PhaseDetail = "CPA 授权失败，已停止注册"
+		})
+		e.opt.Log.Warnf("CPA 授权失败，立即停止任务: %v", err)
+		if e.cancel != nil {
+			e.cancel()
+		}
+	})
+}
+
+// authorizeCPA starts CPA-managed xAI device authorization and waits for human approval.
+// SSO cannot be converted into CPA tokens directly; CPA must obtain its own device grant.
 func (e *Engine) authorizeCPA(ctx context.Context, job SSOJob) error {
+	// Serialize so only one pending human authorization is active.
+	e.cpaAuthMu.Lock()
+	defer e.cpaAuthMu.Unlock()
+
+	if e.aborted.Load() {
+		return fmt.Errorf("pipeline aborted")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	auth, err := e.cpaAuth.StartXAIAuth(ctx)
 	if err != nil {
 		return err
 	}
-	e.opt.Log.Infof("[cpa] device auth %s user_code=%s", job.Email, auth.UserCode)
-	if err := e.oauth.ConfirmVerificationURL(ctx, job.SSO, auth.URL); err != nil {
-		return fmt.Errorf("confirm CPA device code: %w", err)
+
+	e.writePendingCPAAuth(job, auth)
+	e.opt.Log.Warnf("[cpa] 需要人工授权: 请用刚注册账号登录并确认")
+	e.opt.Log.OKf("[cpa] email     = %s", job.Email)
+	if strings.TrimSpace(job.Password) != "" {
+		e.opt.Log.OKf("[cpa] password  = %s", job.Password)
 	}
-	if err := e.cpaAuth.WaitAuth(ctx, auth.State, 2*time.Second, 10*time.Minute); err != nil {
+	e.opt.Log.OKf("[cpa] user_code = %s", auth.UserCode)
+	e.opt.Log.OKf("[cpa] url       = %s", auth.URL)
+	e.opt.Log.Infof("[cpa] state=%s poll=/get-auth-status (timeout=10m)", auth.State)
+	_ = e.opt.Store.Set(func(s *state.Snapshot) {
+		s.Phase = state.PhaseOAuth
+		s.PhaseDetail = fmt.Sprintf("等待人工授权 %s code=%s", job.Email, auth.UserCode)
+	})
+
+	lastLog := time.Time{}
+	err = e.cpaAuth.WaitAuthNotify(ctx, auth.State, 2*time.Second, 10*time.Minute, func(status string, attempt int) {
+		now := time.Now()
+		if lastLog.IsZero() || now.Sub(lastLog) >= 15*time.Second || status == "ok" || status == "error" {
+			e.opt.Log.Infof("[cpa] get-auth-status email=%s status=%s attempt=%d user_code=%s", job.Email, status, attempt, auth.UserCode)
+			lastLog = now
+		}
+	})
+	if err != nil {
 		return err
 	}
+	e.opt.Log.OKf("[cpa] device auth ok %s user_code=%s", job.Email, auth.UserCode)
+	e.clearPendingCPAAuth()
 	return nil
+}
+
+func (e *Engine) writePendingCPAAuth(job SSOJob, auth cpa.DeviceAuth) {
+	if e.opt.Run.Root == "" {
+		return
+	}
+	body := fmt.Sprintf(
+		"time=%s\nemail=%s\npassword=%s\nuser_code=%s\nurl=%s\nstate=%s\n\nSign in as this account, open the URL, and approve the device request.\nCPA stores the token only after /get-auth-status returns status=ok.\n",
+		time.Now().Format(time.RFC3339),
+		job.Email,
+		job.Password,
+		auth.UserCode,
+		auth.URL,
+		auth.State,
+	)
+	path := filepath.Join(e.opt.Run.Root, "cpa-pending-auth.txt")
+	_ = os.WriteFile(path, []byte(body), 0o600)
+	hist := filepath.Join(e.opt.Run.Root, "cpa-device-auth.log")
+	f, err := os.OpenFile(hist, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(fmt.Sprintf("%s\temail=%s\tuser_code=%s\turl=%s\tstate=%s\n",
+		time.Now().Format(time.RFC3339), job.Email, auth.UserCode, auth.URL, auth.State))
+	_ = f.Close()
+}
+
+func (e *Engine) clearPendingCPAAuth() {
+	if e.opt.Run.Root == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(e.opt.Run.Root, "cpa-pending-auth.txt"))
 }
 
 func truncateRunes(s string, n int) string {
