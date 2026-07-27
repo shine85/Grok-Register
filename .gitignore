@@ -42,3 +42,7 @@ data/
 BK/
 焚绝/
 memory/
+
+# Local Codex project link (junction to .agents/skills)
+.codex/
+
