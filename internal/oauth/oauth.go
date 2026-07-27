@@ -533,6 +533,24 @@ func (c *Client) ConfirmHTTP(ctx context.Context, sso string, flow DeviceFlow) e
 	return fmt.Errorf("device_approve_failed")
 }
 
+// ConfirmVerificationURL authorizes a device flow created by another process,
+// such as CLIProxyAPI, while keeping the token exchange in that process.
+func (c *Client) ConfirmVerificationURL(ctx context.Context, sso, verificationURL string) error {
+	verificationURL = strings.TrimSpace(verificationURL)
+	parsed, err := url.Parse(verificationURL)
+	if err != nil {
+		return fmt.Errorf("parse verification URL: %w", err)
+	}
+	userCode := strings.TrimSpace(parsed.Query().Get("user_code"))
+	if userCode == "" {
+		return fmt.Errorf("verification URL missing user_code")
+	}
+	return c.ConfirmHTTP(ctx, sso, DeviceFlow{
+		UserCode:        userCode,
+		VerificationURL: verificationURL,
+	})
+}
+
 func mergeSetCookies(cookie string, h http.Header) string {
 	// Keep existing; append new name=value from Set-Cookie (simple).
 	out := cookie

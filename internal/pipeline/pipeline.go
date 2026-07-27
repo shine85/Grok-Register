@@ -62,6 +62,7 @@ type Engine struct {
 
 	oauthCh  chan SSOJob
 	uploader *cpa.Uploader
+	cpaAuth  *cpa.ManagementClient
 
 	done     atomic.Int64 // CPA successes (counts toward -t)
 	reserved atomic.Int64 // in-flight accounts (email→register→oauth→probe)
@@ -353,8 +354,13 @@ func (e *Engine) run(ctx context.Context) error {
 		log.Infof(f, a...)
 	})
 	if e.uploader.Enabled() {
-		log.Infof("CPA upload enabled base=%s", cfg.CPAManagementBase)
+		log.Infof("CPA managed device auth enabled base=%s", cfg.CPAManagementBase)
 	}
+	e.cpaAuth = cpa.NewManagementClient(cpa.ManagementConfig{
+		BaseURL: cfg.CPAManagementBase,
+		Key:     cfg.CPAManagementKey,
+		Timeout: time.Duration(cfg.CPAUploadTimeoutSec) * time.Second,
+	})
 	e.oauth, err = oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second)
 	if err != nil {
 		return err
@@ -885,6 +891,23 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		if len(ssoPrev) > 24 {
 			ssoPrev = ssoPrev[:12] + "…" + ssoPrev[len(ssoPrev)-8:]
 		}
+		if e.cpaAuth != nil && e.opt.Cfg.CPAUploadEnabled && e.cpaAuth.Enabled() {
+			if err := e.authorizeCPA(ctx, job); err != nil {
+				log.Warnf("CPA OAuth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
+				e.fail.Add(1)
+				e.releaseReserve()
+				continue
+			}
+			e.oaN.Add(1)
+			d, ok := e.tryComplete()
+			if !ok {
+				continue
+			}
+			log.OKf("CPA 已入库 #%d/%d %s", d, e.opt.Target, job.Email)
+			e.refreshState()
+			continue
+		}
+
 		cred, err := e.oauth.Exchange(ctx, job.SSO)
 		if err != nil {
 			log.Warnf("OAuth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
@@ -948,6 +971,21 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		log.OKf("CPA 就绪 #%d/%d %s -> %s", d, e.opt.Target, job.Email, filepath.Base(path))
 		e.refreshState()
 	}
+}
+
+func (e *Engine) authorizeCPA(ctx context.Context, job SSOJob) error {
+	auth, err := e.cpaAuth.StartXAIAuth(ctx)
+	if err != nil {
+		return err
+	}
+	e.opt.Log.Infof("[cpa] device auth %s user_code=%s", job.Email, auth.UserCode)
+	if err := e.oauth.ConfirmVerificationURL(ctx, job.SSO, auth.URL); err != nil {
+		return fmt.Errorf("confirm CPA device code: %w", err)
+	}
+	if err := e.cpaAuth.WaitAuth(ctx, auth.State, 2*time.Second, 10*time.Minute); err != nil {
+		return err
+	}
+	return nil
 }
 
 func truncateRunes(s string, n int) string {
