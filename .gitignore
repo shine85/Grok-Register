@@ -37,3 +37,7 @@ data/
 
 # OpenCode agent working directory
 .omo/
+
+# Local agent backups / research notes (not product code)
+BK/
+焚绝/
