@@ -1229,6 +1229,7 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, 
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	var last error
 	// Fresh SSO sessions sometimes need a short settle before device approve sticks.
+	c.log("oauth confirm=browser-only v2 (playwright/chromedp; no HTTP form)")
 	c.log("exchange settle 1.5s (fresh SSO)")
 	select {
 	case <-ctx.Done():

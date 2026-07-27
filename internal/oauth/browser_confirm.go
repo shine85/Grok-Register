@@ -118,14 +118,13 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 	out := strings.TrimSpace(stdout.String())
 	errText := strings.TrimSpace(stderr.String())
 	if errText != "" {
-		for _, line := range strings.Split(errText, "
-") {
+		for _, line := range strings.Split(errText, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
 			}
 			if len(line) > 220 {
-				line = line[:220] + "…"
+				line = line[:220] + "..."
 			}
 			c.log("device_auth | %s", line)
 		}
