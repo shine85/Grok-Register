@@ -99,6 +99,9 @@ type Config struct {
 	CPAUploadNameTemplate string
 	CPAUploadVerify       bool
 	CPAUploadMode         string // multipart | json
+	// CPADeviceAuthMode: empty/auto = local OAuth + /auth-files upload
+	// manual|device|human = CPA /xai-auth-url human browser
+	CPADeviceAuthMode string
 }
 
 func Defaults() Config {
@@ -141,6 +144,7 @@ func Defaults() Config {
 		CPAUploadNameTemplate: "{email}.json",
 		CPAUploadVerify:       true,
 		CPAUploadMode:         "multipart",
+		CPADeviceAuthMode:     "",
 	}
 }
 
@@ -281,6 +285,9 @@ func Save(path string, cfg Config) error {
 	b.WriteString(fmt.Sprintf("CPA_UPLOAD_VERIFY=%s\n", bool01(cfg.CPAUploadVerify)))
 	if cfg.CPAUploadMode != "" {
 		b.WriteString(fmt.Sprintf("CPA_UPLOAD_MODE=%s\n", cfg.CPAUploadMode))
+	}
+	if cfg.CPADeviceAuthMode != "" {
+		b.WriteString(fmt.Sprintf("CPA_DEVICE_AUTH_MODE=%s\n", cfg.CPADeviceAuthMode))
 	}
 	return os.WriteFile(path, []byte(b.String()), 0o600)
 }
@@ -618,6 +625,9 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["CPA_UPLOAD_MODE"]; ok {
 		cfg.CPAUploadMode = v
+	}
+	if v, ok := env["CPA_DEVICE_AUTH_MODE"]; ok {
+		cfg.CPADeviceAuthMode = strings.ToLower(strings.TrimSpace(v))
 	}
 }
 

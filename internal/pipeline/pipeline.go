@@ -389,8 +389,10 @@ func (e *Engine) run(ctx context.Context) error {
 		Key:     cfg.CPAManagementKey,
 		Timeout: time.Duration(cfg.CPAUploadTimeoutSec) * time.Second,
 	})
-	if e.cpaDeviceFlowEnabled(cfg) {
-		log.Infof("CPA device flow enabled base=%s (manual authorize + poll /get-auth-status)", cpa.NormalizeManagementBase(cfg.CPAManagementBase))
+	if e.cpaManualDeviceAuthEnabled(cfg) {
+		log.Infof("CPA MANUAL device auth enabled base=%s (human browser + /get-auth-status)", cpa.NormalizeManagementBase(cfg.CPAManagementBase))
+	} else if e.uploader != nil && e.uploader.Enabled() {
+		log.Infof("CPA auto 入库 enabled base=%s (local OAuth → /auth-files upload)", cpa.NormalizeManagementBase(cfg.CPAManagementBase))
 	}
 	e.oauth, err = oauth.NewClient(cfg.RegisterProxy, e.cm, time.Duration(cfg.OAuthRetrySec)*time.Second)
 	if err != nil {
@@ -927,12 +929,14 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		if len(ssoPrev) > 24 {
 			ssoPrev = ssoPrev[:12] + "…" + ssoPrev[len(ssoPrev)-8:]
 		}
-		if e.cpaDeviceFlowEnabled(e.opt.Cfg) {
+
+		// Optional manual CPA /xai-auth-url path (human browser). Default is automatic
+		// local device OAuth + Management /auth-files upload.
+		if e.cpaManualDeviceAuthEnabled(e.opt.Cfg) {
 			if err := e.authorizeCPA(ctx, job); err != nil {
 				log.Warnf("CPA device auth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
 				e.fail.Add(1)
 				e.releaseReserve()
-				// Hard stop: do not keep burning emails after device auth failure.
 				if !e.aborted.Load() && ctx.Err() == nil {
 					e.abortRun(fmt.Errorf("CPA device auth failed for %s: %w", job.Email, err))
 				}
@@ -973,55 +977,75 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 				continue
 			}
 		}
-		// Atomic complete: prevents multi-OAuth overshoot of -t.
-		d, ok := e.tryComplete()
-		if !ok {
-			// Target already filled by another worker — keep file in discarded.
-			path, _ := cpa.WriteAtomic(e.opt.Run.Discarded, doc, cpa.DefaultSecret())
-			log.Warnf("已达目标，额外号移入 discarded: %s (%s)", job.Email, filepath.Base(path))
-			continue
-		}
+
 		path, err := cpa.WriteAtomic(e.opt.Run.CPA, doc, cpa.DefaultSecret())
 		if err != nil {
 			log.Warnf("写 CPA 失败: %v", err)
-			// seat already converted to done; count as fail but don't re-open flood
 			e.fail.Add(1)
+			e.releaseReserve()
 			continue
 		}
+
+		// Automatic CPA 入库: sync upload to Management /auth-files when enabled.
 		if e.uploader != nil && e.uploader.Enabled() {
-			up := e.uploader
-			docCopy := doc
-			e.wgUpload.Add(1)
-			go func() {
-				defer e.wgUpload.Done()
-				defer func() { _ = recover() }()
-				log.Infof("[cpa] 开始上传 %s …", docCopy.Email)
-				res := up.UploadDocument(docCopy)
+			log.Infof("[cpa] 开始上传 %s …", doc.Email)
+			res := e.uploader.UploadDocument(doc)
+			if res.Err != nil || !res.OK {
 				if res.Err != nil {
-					log.Warnf("[cpa] 上传失败 %s: %v", docCopy.Email, res.Err)
-				} else if !res.OK {
-					log.Warnf("[cpa] 上传失败 %s status=%d body=%s", docCopy.Email, res.Status, truncateRunes(res.Body, 180))
-				} else if res.Verified {
-					log.OKf("[cpa] 已入库 %s → %s", docCopy.Email, res.Name)
+					log.Warnf("[cpa] 上传失败 %s: %v", doc.Email, res.Err)
 				} else {
-					log.OKf("[cpa] 已上传 %s → %s（列表校验未命中，可能仍成功）", docCopy.Email, res.Name)
+					log.Warnf("[cpa] 上传失败 %s status=%d body=%s", doc.Email, res.Status, truncateRunes(res.Body, 180))
 				}
-			}()
+				// Keep local JSON under discarded so operators can grok upload later.
+				_ = os.MkdirAll(e.opt.Run.Discarded, 0o700)
+				_ = os.Rename(path, filepath.Join(e.opt.Run.Discarded, filepath.Base(path)))
+				e.fail.Add(1)
+				e.releaseReserve()
+				continue
+			}
+			d, ok := e.tryComplete()
+			if !ok {
+				log.Warnf("已达目标，额外号已上传但仍记 discarded: %s", job.Email)
+				continue
+			}
+			if res.Verified {
+				log.OKf("CPA 已入库 #%d/%d %s → %s", d, e.opt.Target, job.Email, res.Name)
+			} else {
+				log.OKf("CPA 已入库 #%d/%d %s → %s（列表校验未命中，上传已成功）", d, e.opt.Target, job.Email, res.Name)
+			}
+			e.refreshState()
+			continue
+		}
+
+		// Local-only success (no Management upload).
+		d, ok := e.tryComplete()
+		if !ok {
+			_ = os.MkdirAll(e.opt.Run.Discarded, 0o700)
+			_ = os.Rename(path, filepath.Join(e.opt.Run.Discarded, filepath.Base(path)))
+			log.Warnf("已达目标，额外号移入 discarded: %s (%s)", job.Email, filepath.Base(path))
+			continue
 		}
 		log.OKf("CPA 就绪 #%d/%d %s -> %s", d, e.opt.Target, job.Email, filepath.Base(path))
 		e.refreshState()
 	}
 }
 
-func (e *Engine) cpaDeviceFlowEnabled(cfg config.Config) bool {
-	if !cfg.CPAUploadEnabled {
+// cpaManualDeviceAuthEnabled is the optional human browser path for CPA /xai-auth-url.
+// Default automatic 入库 uses local OAuth + Management /auth-files upload instead.
+func (e *Engine) cpaManualDeviceAuthEnabled(cfg config.Config) bool {
+	mode := strings.ToLower(strings.TrimSpace(cfg.CPADeviceAuthMode))
+	if mode != "manual" && mode != "device" && mode != "human" {
 		return false
 	}
 	if e.cpaAuth != nil {
 		return e.cpaAuth.Enabled()
 	}
-	// Client may not be constructed yet during worker sizing.
 	return strings.TrimSpace(cfg.CPAManagementBase) != "" && strings.TrimSpace(cfg.CPAManagementKey) != ""
+}
+
+// cpaDeviceFlowEnabled kept as alias used by capacity guards.
+func (e *Engine) cpaDeviceFlowEnabled(cfg config.Config) bool {
+	return e.cpaManualDeviceAuthEnabled(cfg)
 }
 
 func (e *Engine) abortRun(err error) {

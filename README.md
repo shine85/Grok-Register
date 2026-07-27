@@ -211,7 +211,7 @@ cd ~/Grok-Register/clearance && docker compose up -d && docker compose ps
 | Python 3.10+ + venv | Turnstile Playwright mint | 拿不到 token |
 | Playwright + CloakBrowser | 无头过 CF Turnstile | `timeout` / `iframes=0` |
 | Docker | 清障栈（强烈推荐） | 注册/邮箱/CF 更容易挂 |
-| CPA Management（可选） | 注册后人工 device 授权入库 / `grok upload` | 未启用时仍生成本地 `CPA/*.json` |
+| CPA Management（可选） | 注册后自动上传 `/auth-files` 入库 / `grok upload` | 未启用时仍生成本地 `CPA/*.json` |
 
 ### 推荐硬件（运行时，非编译）
 
@@ -636,7 +636,7 @@ CPA_MANAGEMENT_KEY=...
 
 - 宿主机跑 `grok` 必须用 `127.0.0.1`，不要写 `cli-proxy-api`  
 - 新版本会自动改写 docker 主机名并补 `/v0/management`  
-- 注册成功后调用 CPA `/xai-auth-url`，输出完整 device 链接与 `user_code`，由账号所有者人工确认；注册机轮询 `/get-auth-status`，仅 `status=ok` 计为 CPA 已入库；授权失败立即停止
+- 注册成功后本机 OAuth 换票并写 `CPA/*.json`；`CPA_UPLOAD_ENABLED=1` 时同步上传 Management `/auth-files`，成功计为 CPA 已入库（仅 `CPA_DEVICE_AUTH_MODE=manual` 才走人工 device 链接）
 - 授权确认强制提交 `action=allow`，不依赖 Continue / Allow 或继续 / 允许的页面文案
 - CPA 托管模式下 token 由 CPA 换取和保存，不再生成本地 `CPA/*.json`
 - 历史 JSON 手动上传：`grok upload`
