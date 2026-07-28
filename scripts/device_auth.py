@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """Authorize an xAI OAuth device code via Playwright + CloakBrowser.
 
-The accounts.x.ai /oauth2/device page is a JS SPA — pure HTTP form posts only
-bounce to /account and never bind the device_code. This script injects the
-session SSO cookie and clicks Continue/Allow like a real browser.
+accounts.x.ai /oauth2/device is a JS SPA. Bare HTTP form posts with only the
+SSO cookie bounce to /account and never bind device_code. This script:
+
+  1) injects the SSO cookie into a real Chromium session
+  2) warms accounts.x.ai so the SPA establishes session cookies
+  3) opens the verification URL and clicks Continue / Allow
+  4) additionally POSTs /oauth2/device/verify + /approve from inside the page
+     (credentials:include) — this is what actually binds the device_code
 
 Usage:
-  device_auth.py --url VERIFY_URL --sso JWT [--proxy URL] [--chrome PATH]
-                 [--timeout 70] [--mode headless|offscreen]
+  device_auth.py --url VERIFY_URL --sso JWT [--user-code CODE] [--proxy URL]
+                 [--chrome PATH] [--timeout 70] [--mode headless|offscreen]
 
-Exit 0 and print "ok" on UI success. Errors on stderr, non-zero exit otherwise.
+Exit 0 and print "ok" on success. Errors on stderr, non-zero exit otherwise.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import glob
+import json
 import os
 import sys
 import time
+from urllib.parse import parse_qs, urlparse
 
 
 def find_chrome() -> str:
@@ -85,6 +93,54 @@ def launch_args(label: str) -> list[str]:
     if label == "offscreen":
         args.extend(["--window-position=-2400,-2400", "--window-size=1280,800"])
     return args
+
+
+def b64url_json(segment: str) -> dict:
+    raw = segment or ""
+    pad = "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        data = base64.urlsafe_b64decode(raw + pad)
+        return json.loads(data.decode("utf-8", errors="ignore") or "{}")
+    except Exception:
+        return {}
+
+
+def principal_from_sso(sso: str) -> str:
+    parts = (sso or "").split(".")
+    if len(parts) != 3:
+        return ""
+    claims = b64url_json(parts[1])
+    for key in (
+        "sub",
+        "user_id",
+        "userId",
+        "uid",
+        "id",
+        "principal_id",
+        "principalId",
+    ):
+        v = claims.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for nest in ("user", "account", "identity", "profile"):
+        sub = claims.get(nest)
+        if isinstance(sub, dict):
+            for key in ("sub", "id", "user_id", "userId", "uid"):
+                v = sub.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    return ""
+
+
+def user_code_from_url(url: str) -> str:
+    try:
+        q = parse_qs(urlparse(url).query or "")
+        vals = q.get("user_code") or q.get("userCode") or []
+        if vals and str(vals[0]).strip():
+            return str(vals[0]).strip()
+    except Exception:
+        pass
+    return ""
 
 
 CLICK_JS = r"""
@@ -179,8 +235,112 @@ STATUS_JS = r"""
 }
 """
 
+FILL_CODE_JS = r"""
+(code) => {
+  if (!code) return "";
+  const inputs = Array.from(document.querySelectorAll('input[type=text], input[name*=code i], input[id*=code i], input[autocomplete], input'));
+  for (const el of inputs) {
+    const name = ((el.getAttribute("name") || "") + " " + (el.getAttribute("id") || "") + " " + (el.getAttribute("placeholder") || "")).toLowerCase();
+    if (name.includes("user") || name.includes("code") || name.includes("device") || inputs.length === 1) {
+      try {
+        el.focus();
+        el.value = code;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        return "filled:" + (el.getAttribute("name") || el.getAttribute("id") || "input");
+      } catch (e) {}
+    }
+  }
+  return "";
+}
+"""
 
-async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode: str) -> int:
+# In-page fetch with the browser's real session cookies. This is the binding step
+# that pure Go HTTP (bare sso=) could not complete.
+API_AUTH_JS = r"""
+async ({ userCode, principalId }) => {
+  const hosts = ["https://accounts.x.ai", "https://auth.x.ai"];
+  const out = [];
+  const headers = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+  };
+  for (const host of hosts) {
+    try {
+      const vbody = "user_code=" + encodeURIComponent(userCode || "");
+      const vresp = await fetch(host + "/oauth2/device/verify", {
+        method: "POST",
+        credentials: "include",
+        headers,
+        body: vbody,
+        redirect: "follow",
+      });
+      const vtext = await vresp.text();
+      out.push({
+        step: "verify",
+        host,
+        status: vresp.status,
+        url: (vresp.url || "").slice(0, 160),
+        body: (vtext || "").replace(/\s+/g, " ").slice(0, 120),
+      });
+    } catch (e) {
+      out.push({ step: "verify", host, error: String(e).slice(0, 120) });
+    }
+    for (const action of ["allow", "accept"]) {
+      try {
+        const params = new URLSearchParams();
+        params.set("user_code", userCode || "");
+        params.set("action", action);
+        params.set("principal_type", "User");
+        if (principalId) params.set("principal_id", principalId);
+        const aresp = await fetch(host + "/oauth2/device/approve", {
+          method: "POST",
+          credentials: "include",
+          headers,
+          body: params.toString(),
+          redirect: "follow",
+        });
+        const atext = await aresp.text();
+        const low = (atext || "").toLowerCase();
+        const okish =
+          aresp.status >= 200 && aresp.status < 400 &&
+          (low.includes("authorized") ||
+           low.includes("device") ||
+           (aresp.url || "").includes("done") ||
+           (aresp.url || "").includes("device") ||
+           aresp.status === 204 ||
+           aresp.status === 200 ||
+           aresp.status === 302 ||
+           aresp.status === 303 ||
+           aresp.status === 307);
+        out.push({
+          step: "approve",
+          host,
+          action,
+          status: aresp.status,
+          url: (aresp.url || "").slice(0, 160),
+          body: (atext || "").replace(/\s+/g, " ").slice(0, 120),
+          okish: !!okish,
+        });
+      } catch (e) {
+        out.push({ step: "approve", host, action, error: String(e).slice(0, 120) });
+      }
+    }
+  }
+  return out;
+}
+"""
+
+
+async def run(
+    url: str,
+    sso: str,
+    proxy: str,
+    chrome: str,
+    timeout: float,
+    mode: str,
+    user_code: str,
+) -> int:
     try:
         from playwright.async_api import async_playwright
     except Exception as e:
@@ -193,8 +353,14 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
         print("chrome/chromium not found (cloakbrowser/CHROME_PATH)", file=sys.stderr)
         return 1
 
+    user_code = (user_code or user_code_from_url(url) or "").strip()
+    principal = principal_from_sso(sso)
     label, headless = resolve_mode(mode)
-    print(f"device_auth chrome={chrome} mode={label} headless={headless} url={url[:120]}", file=sys.stderr)
+    print(
+        f"device_auth chrome={chrome} mode={label} headless={headless} "
+        f"user_code={user_code or '-'} principal={principal[:18] or '-'} url={url[:120]}",
+        file=sys.stderr,
+    )
 
     launch: dict = {
         "executable_path": chrome,
@@ -204,7 +370,11 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
     if proxy:
         launch["proxy"] = {"server": proxy}
 
-    deadline = time.time() + max(15.0, timeout)
+    deadline = time.time() + max(20.0, timeout)
+    api_done = False
+    last_click = ""
+    last_api = ""
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch)
         try:
@@ -219,15 +389,16 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
             await context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
-            # Playwright: cookie must have EITHER url OR (domain+path), not both.
-            clean = []
+            # Playwright cookie rule: url OR (domain+path), never both.
+            cookies = []
             for curl in (
                 "https://accounts.x.ai/",
                 "https://auth.x.ai/",
                 "https://x.ai/",
                 "https://accounts.x.ai/oauth2/device",
+                "https://auth.x.ai/oauth2/device",
             ):
-                clean.append(
+                cookies.append(
                     {
                         "name": "sso",
                         "value": sso,
@@ -235,16 +406,55 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                         "secure": True,
                     }
                 )
-            await context.add_cookies(clean)
+            await context.add_cookies(cookies)
+
+            # Capture approve/verify network for diagnostics + success signal.
+            hit_paths: list[str] = []
+
+            def on_response(resp) -> None:
+                try:
+                    u = resp.url or ""
+                    if "/oauth2/device/" in u:
+                        hit_paths.append(f"{resp.status}:{u[:140]}")
+                except Exception:
+                    pass
+
+            context.on("response", on_response)
 
             page = await context.new_page()
-            await page.goto("https://accounts.x.ai/", wait_until="domcontentloaded", timeout=30000)
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            print("device_auth warm accounts.x.ai", file=sys.stderr)
+            try:
+                await page.goto(
+                    "https://accounts.x.ai/",
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+            except Exception as e:
+                print(f"warm err: {e}", file=sys.stderr)
+            await asyncio.sleep(0.6)
 
-            last_click = ""
+            print(f"device_auth open verify url={url[:140]}", file=sys.stderr)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            except Exception as e:
+                print(f"goto verify err: {e}", file=sys.stderr)
+            await asyncio.sleep(0.8)
+
+            # Fill user_code if the SPA shows an input.
+            if user_code:
+                try:
+                    filled = await page.evaluate(FILL_CODE_JS, user_code)
+                    if filled:
+                        print(f"device_auth {filled}", file=sys.stderr)
+                except Exception as e:
+                    print(f"fill code err: {e}", file=sys.stderr)
+
             ticks = 0
+            api_attempts = 0
             while time.time() < deadline:
                 ticks += 1
+
+                # UI click pass
                 try:
                     clicked = await page.evaluate(CLICK_JS)
                 except Exception as e:
@@ -259,6 +469,29 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                         pass
                     await asyncio.sleep(0.8)
 
+                # In-page API authorize every few ticks (and once early).
+                if user_code and (ticks in (1, 2, 3) or ticks % 4 == 0) and api_attempts < 6:
+                    api_attempts += 1
+                    try:
+                        results = await page.evaluate(
+                            API_AUTH_JS,
+                            {"userCode": user_code, "principalId": principal},
+                        )
+                        last_api = json.dumps(results, ensure_ascii=False)[:300]
+                        print(f"api_auth[{api_attempts}] {last_api}", file=sys.stderr)
+                        for row in results or []:
+                            if not isinstance(row, dict):
+                                continue
+                            if row.get("step") == "approve" and row.get("okish"):
+                                api_done = True
+                            body = str(row.get("body") or "").lower()
+                            url_hit = str(row.get("url") or "").lower()
+                            if "authorized" in body or "/device/done" in url_hit or "device authorized" in body:
+                                api_done = True
+                    except Exception as e:
+                        print(f"api_auth err: {e}", file=sys.stderr)
+
+                # UI status
                 try:
                     st = await page.evaluate(STATUS_JS)
                 except Exception as e:
@@ -266,8 +499,13 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                     st = {}
 
                 href = (st or {}).get("href") or page.url or ""
-                if (st or {}).get("done") or (st or {}).get("authed"):
-                    print(f"ui_success href={href[:160]} last_click={last_click!r}", file=sys.stderr)
+                if (st or {}).get("done") or (st or {}).get("authed") or api_done:
+                    print(
+                        f"ui_success href={href[:160]} last_click={last_click!r} api_done={api_done}",
+                        file=sys.stderr,
+                    )
+                    if hit_paths:
+                        print(f"net_hits {hit_paths[-6:]}", file=sys.stderr)
                     print("ok")
                     return 0
 
@@ -280,21 +518,56 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
 
                 if ticks % 5 == 0:
                     sample = ((st or {}).get("sample") or "")[:120]
-                    print(f"tick[{ticks}] href={href[:120]} sample={sample!r}", file=sys.stderr)
+                    remain = max(0, int(deadline - time.time()))
+                    print(
+                        f"tick[{ticks}] remain={remain}s href={href[:120]} "
+                        f"sample={sample!r} last_click={last_click!r}",
+                        file=sys.stderr,
+                    )
 
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.2)
+
+            # Final chance: one more API auth + status
+            if user_code:
+                try:
+                    results = await page.evaluate(
+                        API_AUTH_JS,
+                        {"userCode": user_code, "principalId": principal},
+                    )
+                    print(f"api_auth[final] {json.dumps(results, ensure_ascii=False)[:300]}", file=sys.stderr)
+                    for row in results or []:
+                        if isinstance(row, dict) and row.get("step") == "approve" and row.get("okish"):
+                            api_done = True
+                except Exception as e:
+                    print(f"api_auth final err: {e}", file=sys.stderr)
 
             try:
                 st = await page.evaluate(STATUS_JS)
-                if (st or {}).get("done") or (st or {}).get("authed"):
+                if (st or {}).get("done") or (st or {}).get("authed") or api_done:
                     print("ok")
                     return 0
                 print(
-                    f"timeout href={(st or {}).get('href', page.url)!r} last_click={last_click!r} sample={(st or {}).get('sample', '')!r}",
+                    f"timeout href={(st or {}).get('href', page.url)!r} "
+                    f"last_click={last_click!r} api_done={api_done} "
+                    f"sample={(st or {}).get('sample', '')!r}",
                     file=sys.stderr,
                 )
             except Exception as e:
-                print(f"timeout final status err: {e} last_click={last_click!r}", file=sys.stderr)
+                print(
+                    f"timeout final status err: {e} last_click={last_click!r} api_done={api_done}",
+                    file=sys.stderr,
+                )
+            if hit_paths:
+                print(f"net_hits {hit_paths[-8:]}", file=sys.stderr)
+            # If we saw approve network 2xx/3xx, still report ok and let Go token-probe decide.
+            good_net = any(
+                h.startswith(("200:", "201:", "202:", "204:", "302:", "303:", "307:"))
+                and "approve" in h
+                for h in hit_paths
+            )
+            if good_net or api_done:
+                print("ok")
+                return 0
             return 1
         finally:
             await browser.close()
@@ -304,6 +577,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", required=True)
     ap.add_argument("--sso", required=True)
+    ap.add_argument("--user-code", default="")
     ap.add_argument("--proxy", default="")
     ap.add_argument("--chrome", default="")
     ap.add_argument("--timeout", type=float, default=70)
@@ -323,6 +597,7 @@ def main() -> int:
                 chrome=(args.chrome or "").strip(),
                 timeout=float(args.timeout),
                 mode=(args.mode or "headless"),
+                user_code=(args.user_code or "").strip(),
             )
         )
     except Exception as e:

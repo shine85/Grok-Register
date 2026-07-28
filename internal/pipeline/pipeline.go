@@ -405,7 +405,7 @@ func (e *Engine) run(ctx context.Context) error {
 		if script == "" || py == "" {
 			log.Warnf("OAuth device confirm=browser-only but missing tooling py=%q script=%q (CPA auto may fail at OAuth)", py, script)
 		} else {
-			log.Infof("OAuth device confirm=browser-only v2 py=%s script=%s", py, script)
+			log.Infof("OAuth device confirm=browser-only v3 py=%s script=%s", py, script)
 		}
 	}
 
@@ -678,6 +678,7 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		if err := e.phys.Acquire(ctx); err != nil {
 			return
 		}
+		log.Infof("[S%d] turnstile mint start...", id)
 		tok, err := e.turn.Solve(ctx, scfg.SiteKey, pageURL)
 		e.phys.Release()
 		if err != nil {

@@ -37,16 +37,16 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	}
 
 	// 1) Playwright script (preferred in Docker).
-	if err := c.confirmViaPlaywright(ctx, sso, verifyURL); err == nil {
+	if err := c.confirmViaPlaywright(ctx, sso, verifyURL, userCode); err == nil {
 		if code, perr := c.probeTokenOnce(ctx, flow); perr == nil && code == "" {
 			c.log("browser confirm ok via playwright+token")
 			c.ClearRateLimit()
 			return nil
 		} else if perr != nil {
-			c.log("playwright UI ok but token hard err: %v", perr)
+			c.log("playwright UI/API ok but token hard err: %v", perr)
 			return perr
 		} else {
-			c.log("playwright UI ok, token soft=%s — settle probe", code)
+			c.log("playwright UI/API ok, token soft=%s 閳?settle probe", code)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -68,7 +68,7 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	return c.confirmViaChromedp(ctx, sso, verifyURL, flow)
 }
 
-func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string) error {
+func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL, userCode string) error {
 	py := findDeviceAuthPython()
 	script := findDeviceAuthScript()
 	if py == "" {
@@ -88,6 +88,9 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 		"--timeout", "70",
 		"--mode", mode,
 	}
+	if userCode != "" {
+		args = append(args, "--user-code", userCode)
+	}
 	if strings.TrimSpace(c.proxy) != "" {
 		args = append(args, "--proxy", strings.TrimSpace(c.proxy))
 	}
@@ -106,7 +109,7 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 		}
 	}
 
-	c.log("browser playwright py=%s script=%s mode=%s", bin, script, mode)
+	c.log("browser playwright py=%s script=%s mode=%s user_code=%s", bin, script, mode, userCode)
 	runCtx, cancel := context.WithTimeout(ctx, 80*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, bin, binArgs...)
@@ -123,8 +126,8 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 			if line == "" {
 				continue
 			}
-			if len(line) > 220 {
-				line = line[:220] + "..."
+			if len(line) > 240 {
+				line = line[:240] + "..."
 			}
 			c.log("device_auth | %s", line)
 		}
@@ -229,7 +232,10 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
 	defer tabCancel()
 
-	c.log("browser chromedp start chrome=%s url=%s", execPath, trimLoc(verifyURL))
+	userCode := strings.TrimSpace(flow.UserCode)
+	principal := principalFromSSO(sso)
+	c.log("browser chromedp start chrome=%s user_code=%s principal=%s url=%s",
+		execPath, userCode, trimLoc(principal), trimLoc(verifyURL))
 	stealth := "Object.defineProperty(navigator,\"webdriver\",{get:()=>undefined})"
 
 	if err := chromedp.Run(tabCtx,
@@ -249,11 +255,35 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 		return fmt.Errorf("browser_navigate: %w", err)
 	}
 
+	// Best-effort fill user_code input if the SPA shows one.
+	if userCode != "" {
+		var filled string
+		_ = chromedp.Run(tabCtx, chromedp.Evaluate(fmt.Sprintf(`(function(code){
+  var inputs = Array.from(document.querySelectorAll("input"));
+  for (var i=0;i<inputs.length;i++){
+    var el = inputs[i];
+    var name = ((el.getAttribute("name")||"")+" "+(el.id||"")+" "+(el.placeholder||"")).toLowerCase();
+    if (name.indexOf("code")>=0 || name.indexOf("user")>=0 || inputs.length===1) {
+      try { el.focus(); el.value=code;
+        el.dispatchEvent(new Event("input",{bubbles:true}));
+        el.dispatchEvent(new Event("change",{bubbles:true}));
+        return "filled"; } catch(e) {}
+    }
+  }
+  return "";
+})(%q)`, userCode), &filled))
+		if filled != "" {
+			c.log("browser filled user_code input")
+		}
+	}
+
 	deadline := time.Now().Add(60 * time.Second)
 	var lastClick string
 	var lastURL string
 	probeEvery := 5 * time.Second
 	nextProbe := time.Now().Add(2 * time.Second)
+	nextAPI := time.Now()
+	apiAttempts := 0
 	bodyJS := "(document.body && (document.body.innerText||\"\") || \"\").slice(0,240)"
 
 	for time.Now().Before(deadline) {
@@ -275,7 +305,6 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 		if clicked != "" {
 			lastClick = clicked
 			c.log("browser click %q url=%s", clicked, trimLoc(href))
-			// Let SPA navigation / form POST settle before next probe.
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -283,6 +312,61 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 			}
 			_ = chromedp.Run(tabCtx, chromedp.Location(&href))
 			lastURL = href
+		}
+
+		// In-page verify+approve with real browser cookies (the binding step).
+		if userCode != "" && apiAttempts < 6 && time.Now().After(nextAPI) {
+			apiAttempts++
+			nextAPI = time.Now().Add(4 * time.Second)
+			var raw string
+			js := fmt.Sprintf(`(async function(){
+  var userCode = %q;
+  var principalId = %q;
+  var hosts = ["https://accounts.x.ai","https://auth.x.ai"];
+  var out = [];
+  var headers = {"Content-Type":"application/x-www-form-urlencoded","Accept":"text/html,application/json"};
+  for (var hi=0; hi<hosts.length; hi++){
+    var host = hosts[hi];
+    try {
+      var vresp = await fetch(host+"/oauth2/device/verify", {
+        method:"POST", credentials:"include", headers:headers,
+        body:"user_code="+encodeURIComponent(userCode), redirect:"follow"
+      });
+      var vtext = await vresp.text();
+      out.push({step:"verify", host:host, status:vresp.status, url:(vresp.url||"").slice(0,120), body:(vtext||"").replace(/\s+/g," ").slice(0,80)});
+    } catch(e) { out.push({step:"verify", host:host, error:String(e).slice(0,80)}); }
+    var actions = ["allow","accept"];
+    for (var ai=0; ai<actions.length; ai++){
+      try {
+        var params = new URLSearchParams();
+        params.set("user_code", userCode);
+        params.set("action", actions[ai]);
+        params.set("principal_type", "User");
+        if (principalId) params.set("principal_id", principalId);
+        var aresp = await fetch(host+"/oauth2/device/approve", {
+          method:"POST", credentials:"include", headers:headers,
+          body: params.toString(), redirect:"follow"
+        });
+        var atext = await aresp.text();
+        out.push({step:"approve", host:host, action:actions[ai], status:aresp.status, url:(aresp.url||"").slice(0,120), body:(atext||"").replace(/\s+/g," ").slice(0,80)});
+      } catch(e) { out.push({step:"approve", host:host, action:actions[ai], error:String(e).slice(0,80)}); }
+    }
+  }
+  return JSON.stringify(out);
+})()`, userCode, principal)
+			if err := chromedp.Run(tabCtx, chromedp.Evaluate(js, &raw)); err == nil && raw != "" {
+				c.log("browser api_auth[%d] %s", apiAttempts, trimLoc(raw))
+				// Immediate token probe after API attempt.
+				if code, err := c.probeTokenOnce(ctx, flow); err == nil && code == "" {
+					c.log("browser confirm ok via in-page api+token")
+					c.ClearRateLimit()
+					return nil
+				} else if err != nil {
+					return err
+				}
+			} else if err != nil {
+				c.log("browser api_auth err: %v", err)
+			}
 		}
 
 		if isDeviceDone(href) || authorizedBody(bodySample) {
@@ -307,7 +391,6 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 			}
 			c.log("browser token soft=%s url=%s last_click=%q", code, trimLoc(lastURL), lastClick)
 			if strings.Contains(lastURL, "/device/approve") || strings.Contains(lastURL, "/device/consent") {
-				// Force another form submit pass immediately.
 				var again string
 				_ = chromedp.Run(tabCtx, chromedp.Evaluate(deviceClickJS, &again))
 				if again != "" {
@@ -388,7 +471,6 @@ const deviceClickJS = `(function(){
       return tag + ":submit:" + (f.getAttribute("action") || location.pathname).slice(0,60);
     } catch (e) { return ""; }
   }
-  // 1) forms on consent/approve pages
   var forms = Array.from(document.querySelectorAll("form"));
   for (var i=0;i<forms.length;i++) {
     var f = forms[i];
@@ -398,8 +480,7 @@ const deviceClickJS = `(function(){
       if (r) return r;
     }
   }
-  // 2) click labeled controls; if inside form, submit form with action=allow
-  var needles = ["allow","authorize","approve","accept","continue","confirm","允许","授权","批准","继续","确认","同意"];
+  var needles = ["allow","authorize","approve","accept","continue","confirm"];
   var nodes = Array.from(document.querySelectorAll("button[type=submit], input[type=submit], button, [role=button], input[type=button], a"));
   for (var j=0;j<nodes.length;j++) {
     var el = nodes[j];
@@ -413,7 +494,7 @@ const deviceClickJS = `(function(){
     }
     if (!hit) continue;
     var parentForm = el.closest && el.closest("form");
-    if (parentForm && (low.indexOf("allow")>=0 || low.indexOf("authorize")>=0 || low.indexOf("批准")>=0 || low.indexOf("允许")>=0 || low.indexOf("授权")>=0 || low.indexOf("approve")>=0 || low.indexOf("accept")>=0)) {
+    if (parentForm && (low.indexOf("allow")>=0 || low.indexOf("authorize")>=0 || low.indexOf("approve")>=0 || low.indexOf("accept")>=0)) {
       var rs = submitForm(parentForm, "allow-form");
       if (rs) return rs;
     }
@@ -430,4 +511,3 @@ const deviceClickJS = `(function(){
   }
   return "";
 })()`
-
