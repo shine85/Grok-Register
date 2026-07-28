@@ -16,7 +16,7 @@ import sys
 import time
 from urllib.parse import parse_qs, urlparse
 
-DEVICE_AUTH_VERSION = "v5-no-reapprove"
+DEVICE_AUTH_VERSION = "v6-explicit-approve"
 
 
 def find_chrome() -> str:
@@ -343,7 +343,7 @@ async ({ userCode, principalId }) => {
 
 
 
-def poll_device_token(device_code: str, token_url: str, client_id: str, attempts: int = 8):
+def poll_device_token(device_code: str, token_url: str, client_id: str, proxy: str = "", attempts: int = 8):
     """Exchange device_code at token endpoint after UI allow. No browser cookies required."""
     device_code = (device_code or "").strip()
     token_url = (token_url or "").strip() or "https://auth.x.ai/oauth2/token"
@@ -399,6 +399,101 @@ def poll_device_token(device_code: str, token_url: str, client_id: str, attempts
             continue
         time.sleep(1.5)
     return None
+
+
+async def explicit_allow_on_consent(page, user_code: str, principal: str) -> str:
+    """On consent/approve page: force action=allow and submit the real form / POST approve."""
+    js = r"""
+async (args) => {
+  const userCode = args.userCode || "";
+  const principalId = args.principalId || "";
+  const href = location.href || "";
+  // Collect form fields
+  const forms = Array.from(document.querySelectorAll("form"));
+  let form = null;
+  for (const f of forms) {
+    const a = ((f.getAttribute("action")||"") + " " + href).toLowerCase();
+    if (a.includes("approve") || a.includes("consent") || a.includes("device") || forms.length===1) {
+      form = f; break;
+    }
+  }
+  if (!form && forms.length) form = forms[0];
+  const fields = {};
+  if (form) {
+    const fd = new FormData(form);
+    fd.forEach((v,k) => { fields[k] = String(v); });
+    form.querySelectorAll("input,select,textarea,button").forEach(el => {
+      const name = el.getAttribute("name");
+      if (!name) return;
+      if (el.type === "radio" || el.type === "checkbox") {
+        if (el.checked) fields[name] = el.value || "on";
+      } else if (el.tagName === "BUTTON" || el.type === "submit") {
+        // skip
+      } else if (el.value != null && el.value !== "" && fields[name] == null) {
+        fields[name] = el.value;
+      }
+    });
+  }
+  fields["user_code"] = userCode || fields["user_code"] || "";
+  fields["action"] = "allow";
+  fields["principal_type"] = fields["principal_type"] || "User";
+  if (principalId) fields["principal_id"] = principalId;
+  // Prefer real form submit with allow button
+  if (form) {
+    let actionInput = form.querySelector('[name=action], [name=Action]');
+    if (!actionInput) {
+      actionInput = document.createElement("input");
+      actionInput.type = "hidden";
+      actionInput.name = "action";
+      form.appendChild(actionInput);
+    }
+    actionInput.value = "allow";
+    let uc = form.querySelector('[name=user_code]');
+    if (!uc) {
+      uc = document.createElement("input");
+      uc.type = "hidden"; uc.name = "user_code"; form.appendChild(uc);
+    }
+    uc.value = fields["user_code"];
+    // Click Allow-looking submit only
+    const btns = Array.from(form.querySelectorAll("button, input[type=submit]"));
+    let allowBtn = null;
+    for (const b of btns) {
+      const t = ((b.innerText||b.textContent||b.value||"")+"").toLowerCase();
+      if (t.includes("deny")||t.includes("cancel")||t.includes("reject")) {
+        b.disabled = true; continue;
+      }
+      if (t.includes("allow")||t.includes("authorize")||t.includes("approve")||t.includes("accept")) {
+        allowBtn = b; break;
+      }
+    }
+    if (allowBtn) { allowBtn.click(); return "explicit:btn:" + ((allowBtn.innerText||allowBtn.value||"Allow")+"").slice(0,40); }
+    form.submit();
+    return "explicit:form-submit";
+  }
+  // No form — POST approve directly from page
+  const bodies = [];
+  for (const host of ["https://auth.x.ai", "https://accounts.x.ai"]) {
+    const params = new URLSearchParams();
+    Object.keys(fields).forEach(k => params.set(k, fields[k]));
+    try {
+      const resp = await fetch(host + "/oauth2/device/approve", {
+        method: "POST", credentials: "include",
+        headers: {"Content-Type":"application/x-www-form-urlencoded","Accept":"text/html,application/json"},
+        body: params.toString(), redirect: "follow",
+      });
+      const text = await resp.text();
+      bodies.push({host, status: resp.status, url: (resp.url||"").slice(0,160), body: (text||"").replace(/\s+/g," ").slice(0,100)});
+    } catch (e) {
+      bodies.push({host, error: String(e).slice(0,100)});
+    }
+  }
+  return "explicit:fetch:" + JSON.stringify(bodies).slice(0,240);
+}
+"""
+    try:
+        return await page.evaluate(js, {"userCode": user_code, "principalId": principal})
+    except Exception as e:
+        return f"explicit_err:{e}"
 
 async def playwright_click_allow_or_continue(page) -> str:
     """Prefer real Playwright clicks; never activate Deny/Cancel."""
@@ -525,19 +620,28 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 try:
                     u = resp.url or ""
                     if "/oauth2/device/" in u:
-                        hit_paths.append(f"{resp.status}:{u[:140]}")
+                        hit_paths.append(f"{resp.status}:{u[:180]}")
+                        if "approve" in u or "done" in u:
+                            print(f"net {resp.status} {u[:200]}", file=sys.stderr)
                 except Exception:
                     pass
 
             context.on("response", on_response)
             page = await context.new_page()
 
-            print("device_auth warm accounts.x.ai", file=sys.stderr)
-            try:
-                await page.goto("https://accounts.x.ai/", wait_until="domcontentloaded", timeout=30000)
-            except Exception as e:
-                print(f"warm err: {e}", file=sys.stderr)
-            await asyncio.sleep(0.8)
+            # Activate session: accounts + grok app (new accounts often deny device token otherwise)
+            for warm_url in (
+                "https://accounts.x.ai/",
+                "https://accounts.x.ai/account",
+                "https://grok.x.ai/",
+                "https://grok.com/",
+            ):
+                try:
+                    print(f"device_auth warm {warm_url}", file=sys.stderr)
+                    await page.goto(warm_url, wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    print(f"warm err {warm_url}: {e}", file=sys.stderr)
 
             print(f"device_auth open verify url={url[:140]}", file=sys.stderr)
             try:
@@ -579,6 +683,22 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                     }""")
                 except Exception:
                     pass
+
+                # If already on consent, prefer explicit allow submit (binds device_code for real).
+                href_pre = page.url or ""
+                if "/consent" in href_pre or "/approve" in href_pre:
+                    try:
+                        ex = await explicit_allow_on_consent(page, user_code, principal)
+                        if ex:
+                            last_click = ex
+                            print(f"explicit_allow[{ticks}] {ex!r}", file=sys.stderr)
+                            try:
+                                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1.2)
+                    except Exception as e:
+                        print(f"explicit_allow err: {e}", file=sys.stderr)
 
                 clicked = ""
                 try:
@@ -625,7 +745,7 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                     if hit_paths:
                         print(f"net_hits {hit_paths[-8:]}", file=sys.stderr)
                     # Optional in-script token poll (avoids Go tls-client mismatch).
-                    tok = poll_device_token(device_code, token_url, client_id)
+                    print("token_poll waiting 2s after allow/done...", file=sys.stderr); time.sleep(2.0); tok = poll_device_token(device_code, token_url, client_id, proxy, attempts=12)
                     if tok:
                         print("TOKEN_JSON:" + json.dumps(tok, ensure_ascii=False))
                     print("ok")
@@ -653,7 +773,7 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
 
                 if api_bound and not click_was_deny(last_click):
                     print(f"api_bound success last_click={last_click!r}", file=sys.stderr)
-                    tok = poll_device_token(device_code, token_url, client_id)
+                    print("token_poll waiting 2s after allow/done...", file=sys.stderr); time.sleep(2.0); tok = poll_device_token(device_code, token_url, client_id, proxy, attempts=12)
                     if tok:
                         print("TOKEN_JSON:" + json.dumps(tok, ensure_ascii=False))
                     print("ok")

@@ -1245,11 +1245,11 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	var last error
 	// Fresh SSO sessions sometimes need a short settle before device approve sticks.
 	c.log("oauth confirm=browser-only v3 (playwright/chromedp + in-page verify/approve)")
-	c.log("exchange settle 1.5s (fresh SSO)")
+	c.log("exchange settle 5s (fresh SSO + account activate)")
 	select {
 	case <-ctx.Done():
 		return Credential{}, ctx.Err()
-	case <-time.After(1500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
