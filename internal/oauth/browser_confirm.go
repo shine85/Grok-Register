@@ -452,62 +452,99 @@ const deviceClickJS = `(function(){
     return !(style && (style.display==="none" || style.visibility==="hidden"));
   }
   function labelOf(el){
-    return ((el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "")+"").trim();
+    return ((el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || el.getAttribute("name") || "")+"").trim();
+  }
+  function isDeny(label){
+    const low = (label || "").toLowerCase();
+    const bad = ["deny","cancel","reject","decline","revoke"];
+    for (var i=0;i<bad.length;i++){ if (low===bad[i] || low.indexOf(bad[i])>=0) return true; }
+    return false;
+  }
+  function isAllow(label){
+    const low = (label || "").toLowerCase();
+    const good = ["allow","authorize","approve","accept","grant"];
+    for (var i=0;i<good.length;i++){ if (low===good[i] || low.indexOf(good[i])>=0) return true; }
+    return false;
+  }
+  function isContinue(label){
+    const low = (label || "").toLowerCase();
+    const good = ["continue","confirm","next","proceed"];
+    for (var i=0;i<good.length;i++){ if (low===good[i] || low.indexOf(good[i])>=0) return true; }
+    return false;
+  }
+  function ensureActionAllow(f){
+    var actionInput = f.querySelector('[name=action], [name=Action]');
+    if (!actionInput) {
+      actionInput = document.createElement('input');
+      actionInput.type = 'hidden';
+      actionInput.name = 'action';
+      f.appendChild(actionInput);
+    }
+    actionInput.value = 'allow';
+  }
+  function pickButton(f){
+    var nodes = Array.from(f.querySelectorAll('button, input[type=submit], input[type=button]'));
+    var allowBtn = null, contBtn = null;
+    for (var i=0;i<nodes.length;i++){
+      var el = nodes[i];
+      if (!visible(el)) continue;
+      var lab = labelOf(el);
+      if (isDeny(lab)) continue;
+      if (isAllow(lab)) { allowBtn = el; break; }
+      if (isContinue(lab) && !contBtn) contBtn = el;
+    }
+    return allowBtn || contBtn || null;
   }
   function submitForm(f, tag){
     try {
       if (!f) return "";
-      var actionInput = f.querySelector('[name=action], [name=Action]');
-      if (!actionInput) {
-        actionInput = document.createElement('input');
-        actionInput.type = 'hidden';
-        actionInput.name = 'action';
-        f.appendChild(actionInput);
-      }
-      if (!actionInput.value) actionInput.value = 'allow';
-      var btn = f.querySelector('button[type=submit], input[type=submit], button');
-      if (btn && visible(btn)) { btn.click(); return tag + ":btn:" + labelOf(btn).slice(0,40); }
+      ensureActionAllow(f);
+      var btn = pickButton(f);
+      if (btn) { btn.click(); return tag + ":btn:" + labelOf(btn).slice(0,40); }
       f.submit();
-      return tag + ":submit:" + (f.getAttribute("action") || location.pathname).slice(0,60);
+      return tag + ":submit-allow:" + (f.getAttribute("action") || location.pathname).slice(0,60);
     } catch (e) { return ""; }
+  }
+  var onConsent = href.indexOf("consent")>=0 || href.indexOf("approve")>=0;
+  var nodes = Array.from(document.querySelectorAll("button[type=submit], input[type=submit], button, [role=button], input[type=button], a"));
+  if (onConsent) {
+    for (var j=0;j<nodes.length;j++){
+      var el = nodes[j];
+      if (!visible(el)) continue;
+      var label = labelOf(el);
+      if (!label || isDeny(label) || !isAllow(label)) continue;
+      var pf = el.closest && el.closest("form");
+      if (pf) { var rs = submitForm(pf, "allow-form"); if (rs) return rs; }
+      try { el.click(); return "allow:"+label.slice(0,40); } catch (e) {}
+    }
   }
   var forms = Array.from(document.querySelectorAll("form"));
   for (var i=0;i<forms.length;i++) {
     var f = forms[i];
     var action = ((f.getAttribute("action") || "") + " " + href).toLowerCase();
-    if (action.indexOf("approve")>=0 || action.indexOf("consent")>=0 || action.indexOf("device")>=0 || forms.length===1) {
+    if (action.indexOf("approve")>=0 || action.indexOf("consent")>=0 || action.indexOf("device")>=0 || action.indexOf("verify")>=0 || forms.length===1) {
       var r = submitForm(f, "form");
       if (r) return r;
     }
   }
-  var needles = ["allow","authorize","approve","accept","continue","confirm"];
-  var nodes = Array.from(document.querySelectorAll("button[type=submit], input[type=submit], button, [role=button], input[type=button], a"));
-  for (var j=0;j<nodes.length;j++) {
-    var el = nodes[j];
-    if (!visible(el)) continue;
-    var label = labelOf(el);
-    if (!label) continue;
-    var low = label.toLowerCase();
-    var hit = false;
-    for (var k=0;k<needles.length;k++) {
-      if (low === needles[k] || low.indexOf(needles[k])>=0) { hit = true; break; }
-    }
-    if (!hit) continue;
-    var parentForm = el.closest && el.closest("form");
-    if (parentForm && (low.indexOf("allow")>=0 || low.indexOf("authorize")>=0 || low.indexOf("approve")>=0 || low.indexOf("accept")>=0)) {
-      var rs = submitForm(parentForm, "allow-form");
-      if (rs) return rs;
-    }
-    try { el.click(); return label.slice(0,60); } catch (e) {}
+  var priority = [];
+  for (var n=0;n<nodes.length;n++){
+    var el2 = nodes[n];
+    if (!visible(el2)) continue;
+    var lab2 = labelOf(el2);
+    if (!lab2 || isDeny(lab2)) continue;
+    if (isAllow(lab2)) priority.push({el:el2, lab:lab2, p:0});
+    else if (isContinue(lab2)) priority.push({el:el2, lab:lab2, p:1});
   }
-  var primary = document.querySelector("button[type=submit], button.bg-primary, button[data-testid*=allow], button[data-testid*=authorize]");
-  if (primary && visible(primary)) {
-    var pf = primary.closest && primary.closest("form");
-    if (pf) {
-      var r2 = submitForm(pf, "primary-form");
-      if (r2) return r2;
+  priority.sort(function(a,b){ return a.p - b.p; });
+  for (var k=0;k<priority.length;k++){
+    var item = priority[k];
+    var parentForm = item.el.closest && item.el.closest("form");
+    if (parentForm && item.p === 0) {
+      var rs2 = submitForm(parentForm, "allow-form");
+      if (rs2) return rs2;
     }
-    try { primary.click(); return labelOf(primary).slice(0,60) || "primary"; } catch (e) {}
+    try { item.el.click(); return item.lab.slice(0,60); } catch (e) {}
   }
   return "";
 })()`
