@@ -132,6 +132,13 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL, userC
 			c.log("device_auth | %s", line)
 		}
 	}
+	lowErr := strings.ToLower(errText + " " + out)
+	if strings.Contains(lowErr, "form:btn:deny") ||
+		strings.Contains(lowErr, "deny_click_aborted") ||
+		strings.Contains(lowErr, "last_click='form:btn:deny") ||
+		strings.Contains(lowErr, "last_click=\"form:btn:deny") {
+		return fmt.Errorf("device_auth clicked Deny (refusing fake success)")
+	}
 	if err != nil {
 		if errText == "" {
 			errText = err.Error()
@@ -140,6 +147,9 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL, userC
 	}
 	if !strings.Contains(strings.ToLower(out), "ok") {
 		return fmt.Errorf("device_auth: no ok in stdout (%s)", trimLoc(out+" "+errText))
+	}
+	if !strings.Contains(errText, "v4-no-deny") && !strings.Contains(errText, "DEVICE_AUTH_VERSION") {
+		c.log("device_auth warning: script missing v4-no-deny banner (stale image?)")
 	}
 	return nil
 }

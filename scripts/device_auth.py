@@ -16,6 +16,8 @@ import sys
 import time
 from urllib.parse import parse_qs, urlparse
 
+DEVICE_AUTH_VERSION = "v4-no-deny"
+
 
 def find_chrome() -> str:
     env = (os.environ.get("CHROME_PATH") or "").strip()
@@ -339,6 +341,66 @@ async ({ userCode, principalId }) => {
 }
 """
 
+
+async def playwright_click_allow_or_continue(page) -> str:
+    """Prefer real Playwright clicks; never activate Deny/Cancel."""
+    # Allow / Authorize first (consent page)
+    allow_names = ("Allow", "Authorize", "Approve", "Accept", "允许", "授权", "批准", "同意")
+    cont_names = ("Continue", "Confirm", "Next", "继续", "确认", "下一步")
+    deny_names = ("Deny", "Cancel", "Reject", "Decline", "拒绝", "取消")
+
+    async def try_names(names, tag: str) -> str:
+        for name in names:
+            for role in ("button", "link"):
+                try:
+                    loc = page.get_by_role(role, name=name, exact=True)
+                    if await loc.count() < 1:
+                        loc = page.get_by_role(role, name=name, exact=False)
+                    n = await loc.count()
+                    if n < 1:
+                        continue
+                    # pick first visible non-deny
+                    for i in range(min(n, 4)):
+                        item = loc.nth(i)
+                        try:
+                            if not await item.is_visible():
+                                continue
+                            txt = ((await item.inner_text()) or "").strip()
+                            low = txt.lower()
+                            if any(d.lower() in low for d in deny_names):
+                                continue
+                            await item.click(timeout=2500)
+                            return f"{tag}:{txt[:40] or name}"
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            # text locator fallback
+            try:
+                loc = page.get_by_text(name, exact=True)
+                if await loc.count() < 1:
+                    continue
+                item = loc.first
+                if await item.is_visible():
+                    txt = ((await item.inner_text()) or name).strip()
+                    low = txt.lower()
+                    if any(d.lower() in low for d in deny_names):
+                        continue
+                    await item.click(timeout=2500)
+                    return f"{tag}-text:{txt[:40]}"
+            except Exception:
+                pass
+        return ""
+
+    hit = await try_names(allow_names, "pw-allow")
+    if hit:
+        return hit
+    # On consent URL, do NOT fall through to Continue-only if Allow missing — try JS next
+    href = (page.url or "").lower()
+    if "consent" in href or "approve" in href:
+        return ""
+    return await try_names(cont_names, "pw-continue")
+
 async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode: str, user_code: str) -> int:
     try:
         from playwright.async_api import async_playwright
@@ -357,7 +419,7 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
     keys = claim_keys(sso)
     label, headless = resolve_mode(mode)
     print(
-        f"device_auth chrome={chrome} mode={label} headless={headless} "
+        f"device_auth {DEVICE_AUTH_VERSION} chrome={chrome} mode={label} headless={headless} "
         f"user_code={user_code or '-'} principal={principal[:24] or '-'} "
         f"claims={keys or '-'} url={url[:120]}",
         file=sys.stderr,
@@ -438,12 +500,40 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
             api_attempts = 0
             while time.time() < deadline:
                 ticks += 1
-
                 try:
-                    clicked = await page.evaluate(CLICK_JS)
+                    await page.evaluate("""() => {
+                      document.querySelectorAll('form').forEach(f => {
+                        let a = f.querySelector('[name=action], [name=Action]');
+                        if (!a) {
+                          a = document.createElement('input');
+                          a.type = 'hidden'; a.name = 'action'; f.appendChild(a);
+                        }
+                        a.value = 'allow';
+                        // disable deny buttons so accidental submit cannot deny
+                        f.querySelectorAll('button, input[type=submit], input[type=button]').forEach(b => {
+                          const t = ((b.innerText || b.textContent || b.value || '')+'').toLowerCase();
+                          if (t.includes('deny') || t.includes('cancel') || t.includes('reject')) {
+                            b.setAttribute('disabled', 'true');
+                            b.style.pointerEvents = 'none';
+                          }
+                        });
+                      });
+                    }""")
+                except Exception:
+                    pass
+
+                clicked = ""
+                try:
+                    clicked = await playwright_click_allow_or_continue(page)
                 except Exception as e:
-                    print(f"click eval err: {e}", file=sys.stderr)
+                    print(f"pw click err: {e}", file=sys.stderr)
                     clicked = ""
+                if not clicked:
+                    try:
+                        clicked = await page.evaluate(CLICK_JS)
+                    except Exception as e:
+                        print(f"click eval err: {e}", file=sys.stderr)
+                        clicked = ""
                 if clicked:
                     last_click = clicked
                     print(f"click[{ticks}] {clicked!r}", file=sys.stderr)
