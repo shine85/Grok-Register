@@ -89,35 +89,69 @@ def launch_args(label: str) -> list[str]:
 
 CLICK_JS = r"""
 () => {
-  const needles = [
-    "allow","authorize","approve","accept","continue","confirm",
-    "允许","授权","批准","继续","确认","同意"
-  ];
-  const nodes = Array.from(document.querySelectorAll(
-    "button, [role=button], input[type=submit], input[type=button], a"
-  ));
-  for (const el of nodes) {
-    if (el.disabled || el.getAttribute("aria-disabled") === "true") continue;
+  const href = (location.href || "").toLowerCase();
+  function visible(el){
+    if (!el || el.disabled || el.getAttribute("aria-disabled")==="true") return false;
     const style = window.getComputedStyle(el);
-    if (style && (style.display === "none" || style.visibility === "hidden")) continue;
-    const label = ((el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "") + "").trim();
-    if (!label) continue;
-    const low = label.toLowerCase();
-    for (const n of needles) {
-      if (low === n || low.includes(n)) {
-        try { el.click(); return label.slice(0, 80); } catch (e) {}
+    return !(style && (style.display==="none" || style.visibility==="hidden"));
+  }
+  function labelOf(el){
+    return ((el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "")+"").trim();
+  }
+  function submitForm(f, tag){
+    try {
+      if (!f) return "";
+      var actionInput = f.querySelector('[name=action], [name=Action]');
+      if (!actionInput) {
+        actionInput = document.createElement('input');
+        actionInput.type = 'hidden';
+        actionInput.name = 'action';
+        f.appendChild(actionInput);
       }
+      if (!actionInput.value) actionInput.value = 'allow';
+      var btn = f.querySelector('button[type=submit], input[type=submit], button');
+      if (btn && visible(btn)) { btn.click(); return tag + ":btn:" + labelOf(btn).slice(0,40); }
+      f.submit();
+      return tag + ":submit:" + (f.getAttribute("action") || location.pathname).slice(0,60);
+    } catch (e) { return ""; }
+  }
+  var forms = Array.from(document.querySelectorAll("form"));
+  for (var i=0;i<forms.length;i++) {
+    var f = forms[i];
+    var action = ((f.getAttribute("action") || "") + " " + href).toLowerCase();
+    if (action.indexOf("approve")>=0 || action.indexOf("consent")>=0 || action.indexOf("device")>=0 || forms.length===1) {
+      var r = submitForm(f, "form");
+      if (r) return r;
     }
   }
-  const primary = document.querySelector(
-    "button[type=submit], button.bg-primary, button[data-testid*=allow], button[data-testid*=authorize]"
-  );
-  if (primary) {
-    try {
-      const label = ((primary.innerText || primary.textContent || "") + "").trim().slice(0, 80);
-      primary.click();
-      return label || "primary";
-    } catch (e) {}
+  var needles = ["allow","authorize","approve","accept","continue","confirm","允许","授权","批准","继续","确认","同意"];
+  var nodes = Array.from(document.querySelectorAll("button[type=submit], input[type=submit], button, [role=button], input[type=button], a"));
+  for (var j=0;j<nodes.length;j++) {
+    var el = nodes[j];
+    if (!visible(el)) continue;
+    var label = labelOf(el);
+    if (!label) continue;
+    var low = label.toLowerCase();
+    var hit = false;
+    for (var k=0;k<needles.length;k++) {
+      if (low === needles[k] || low.indexOf(needles[k])>=0) { hit = true; break; }
+    }
+    if (!hit) continue;
+    var parentForm = el.closest && el.closest("form");
+    if (parentForm && (low.indexOf("allow")>=0 || low.indexOf("authorize")>=0 || low.indexOf("approve")>=0 || low.indexOf("accept")>=0 || low.indexOf("允许")>=0 || low.indexOf("授权")>=0 || low.indexOf("批准")>=0)) {
+      var rs = submitForm(parentForm, "allow-form");
+      if (rs) return rs;
+    }
+    try { el.click(); return label.slice(0,60); } catch (e) {}
+  }
+  var primary = document.querySelector("button[type=submit], button.bg-primary, button[data-testid*=allow], button[data-testid*=authorize]");
+  if (primary && visible(primary)) {
+    var pf = primary.closest && primary.closest("form");
+    if (pf) {
+      var r2 = submitForm(pf, "primary-form");
+      if (r2) return r2;
+    }
+    try { primary.click(); return labelOf(primary).slice(0,60) || "primary"; } catch (e) {}
   }
   return "";
 }
@@ -128,6 +162,8 @@ STATUS_JS = r"""
   const href = location.href || "";
   const text = ((document.body && document.body.innerText) || "").slice(0, 500).toLowerCase();
   const done = href.includes("/oauth2/device/done") || href.includes("/device/done");
+  const on_approve = href.includes("/oauth2/device/approve") || href.includes("/device/approve");
+  const on_consent = href.includes("/consent") || href.includes("user_code=");
   const authed =
     text.includes("device authorized") ||
     text.includes("device is authorized") ||
@@ -139,7 +175,7 @@ STATUS_JS = r"""
     href.includes("/sign-in") ||
     href.includes("/login") ||
     (text.includes("sign in") && text.includes("password"));
-  return { href, done, authed, login, sample: text.slice(0, 160) };
+  return { href, done, authed, login, on_approve, on_consent, sample: text.slice(0, 160) };
 }
 """
 
@@ -183,14 +219,19 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
             await context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
             )
+            # Playwright: cookie must have EITHER url OR (domain+path), not both.
             clean = []
-            for curl in ("https://accounts.x.ai/", "https://auth.x.ai/", "https://x.ai/"):
+            for curl in (
+                "https://accounts.x.ai/",
+                "https://auth.x.ai/",
+                "https://x.ai/",
+                "https://accounts.x.ai/oauth2/device",
+            ):
                 clean.append(
                     {
                         "name": "sso",
                         "value": sso,
                         "url": curl,
-                        "path": "/",
                         "secure": True,
                     }
                 )
@@ -212,6 +253,11 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 if clicked:
                     last_click = clicked
                     print(f"click[{ticks}] {clicked!r}", file=sys.stderr)
+                    try:
+                        await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.8)
 
                 try:
                     st = await page.evaluate(STATUS_JS)

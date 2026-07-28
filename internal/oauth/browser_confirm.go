@@ -275,6 +275,14 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 		if clicked != "" {
 			lastClick = clicked
 			c.log("browser click %q url=%s", clicked, trimLoc(href))
+			// Let SPA navigation / form POST settle before next probe.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+			_ = chromedp.Run(tabCtx, chromedp.Location(&href))
+			lastURL = href
 		}
 
 		if isDeviceDone(href) || authorizedBody(bodySample) {
@@ -298,6 +306,14 @@ func (c *Client) confirmViaChromedp(ctx context.Context, sso, verifyURL string, 
 				return err
 			}
 			c.log("browser token soft=%s url=%s last_click=%q", code, trimLoc(lastURL), lastClick)
+			if strings.Contains(lastURL, "/device/approve") || strings.Contains(lastURL, "/device/consent") {
+				// Force another form submit pass immediately.
+				var again string
+				_ = chromedp.Run(tabCtx, chromedp.Evaluate(deviceClickJS, &again))
+				if again != "" {
+					c.log("browser re-submit %q on %s", again, trimLoc(lastURL))
+				}
+			}
 			if code == "slow_down" {
 				nextProbe = time.Now().Add(8 * time.Second)
 			} else {
@@ -346,35 +362,72 @@ func setSSOCookies(ctx context.Context, sso string) error {
 
 // deviceClickJS clicks Continue / Allow / Authorize style controls on the device SPA.
 const deviceClickJS = `(function(){
-  const needles = [
-    "allow","authorize","approve","accept","continue","confirm",
-    "允许","授权","批准","继续","确认","同意"
-  ];
-  const nodes = Array.from(document.querySelectorAll(
-    "button, [role=button], input[type=submit], input[type=button], a"
-  ));
-  for (const el of nodes) {
-    if (el.disabled || el.getAttribute("aria-disabled")==="true") continue;
+  const href = (location.href || "").toLowerCase();
+  function visible(el){
+    if (!el || el.disabled || el.getAttribute("aria-disabled")==="true") return false;
     const style = window.getComputedStyle(el);
-    if (style && (style.display==="none" || style.visibility==="hidden")) continue;
-    const label = ((el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "")+"").trim();
-    if (!label) continue;
-    const low = label.toLowerCase();
-    for (const n of needles) {
-      if (low === n || low.includes(n)) {
-        try { el.click(); return label.slice(0,60); } catch (e) {}
+    return !(style && (style.display==="none" || style.visibility==="hidden"));
+  }
+  function labelOf(el){
+    return ((el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "")+"").trim();
+  }
+  function submitForm(f, tag){
+    try {
+      if (!f) return "";
+      var actionInput = f.querySelector('[name=action], [name=Action]');
+      if (!actionInput) {
+        actionInput = document.createElement('input');
+        actionInput.type = 'hidden';
+        actionInput.name = 'action';
+        f.appendChild(actionInput);
       }
+      if (!actionInput.value) actionInput.value = 'allow';
+      var btn = f.querySelector('button[type=submit], input[type=submit], button');
+      if (btn && visible(btn)) { btn.click(); return tag + ":btn:" + labelOf(btn).slice(0,40); }
+      f.submit();
+      return tag + ":submit:" + (f.getAttribute("action") || location.pathname).slice(0,60);
+    } catch (e) { return ""; }
+  }
+  // 1) forms on consent/approve pages
+  var forms = Array.from(document.querySelectorAll("form"));
+  for (var i=0;i<forms.length;i++) {
+    var f = forms[i];
+    var action = ((f.getAttribute("action") || "") + " " + href).toLowerCase();
+    if (action.indexOf("approve")>=0 || action.indexOf("consent")>=0 || action.indexOf("device")>=0 || forms.length===1) {
+      var r = submitForm(f, "form");
+      if (r) return r;
     }
   }
-  const primary = document.querySelector(
-    "button[type=submit], button.bg-primary, button[data-testid*=allow], button[data-testid*=authorize]"
-  );
-  if (primary) {
-    try {
-      const label = ((primary.innerText || primary.textContent || "")+"").trim().slice(0,60);
-      primary.click();
-      return label || "primary";
-    } catch (e) {}
+  // 2) click labeled controls; if inside form, submit form with action=allow
+  var needles = ["allow","authorize","approve","accept","continue","confirm","允许","授权","批准","继续","确认","同意"];
+  var nodes = Array.from(document.querySelectorAll("button[type=submit], input[type=submit], button, [role=button], input[type=button], a"));
+  for (var j=0;j<nodes.length;j++) {
+    var el = nodes[j];
+    if (!visible(el)) continue;
+    var label = labelOf(el);
+    if (!label) continue;
+    var low = label.toLowerCase();
+    var hit = false;
+    for (var k=0;k<needles.length;k++) {
+      if (low === needles[k] || low.indexOf(needles[k])>=0) { hit = true; break; }
+    }
+    if (!hit) continue;
+    var parentForm = el.closest && el.closest("form");
+    if (parentForm && (low.indexOf("allow")>=0 || low.indexOf("authorize")>=0 || low.indexOf("批准")>=0 || low.indexOf("允许")>=0 || low.indexOf("授权")>=0 || low.indexOf("approve")>=0 || low.indexOf("accept")>=0)) {
+      var rs = submitForm(parentForm, "allow-form");
+      if (rs) return rs;
+    }
+    try { el.click(); return label.slice(0,60); } catch (e) {}
+  }
+  var primary = document.querySelector("button[type=submit], button.bg-primary, button[data-testid*=allow], button[data-testid*=authorize]");
+  if (primary && visible(primary)) {
+    var pf = primary.closest && primary.closest("form");
+    if (pf) {
+      var r2 = submitForm(pf, "primary-form");
+      if (r2) return r2;
+    }
+    try { primary.click(); return labelOf(primary).slice(0,60) || "primary"; } catch (e) {}
   }
   return "";
 })()`
+;
