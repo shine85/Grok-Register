@@ -26,6 +26,8 @@ const (
 	DiscoveryURL = "https://auth.x.ai/.well-known/openid-configuration"
 	ClientID     = "b1a00492-073a-47ea-816f-4c329264a828"
 	Scope        = "openid profile email offline_access grok-cli:access api:access"
+	// ScopeMinimal drops api:access — some free accounts deny the wider set.
+	ScopeMinimal = "openid profile email offline_access grok-cli:access"
 	VerifyURL    = "https://auth.x.ai/oauth2/device/verify"
 	ApproveURL   = "https://auth.x.ai/oauth2/device/approve"
 	// accounts.x.ai mirrors (current browser device UX hosts here)
@@ -209,13 +211,20 @@ func pow15(n int) float64 {
 }
 
 func (c *Client) StartDeviceFlow(ctx context.Context) (DeviceFlow, error) {
+	return c.StartDeviceFlowWithScope(ctx, Scope)
+}
+
+func (c *Client) StartDeviceFlowWithScope(ctx context.Context, scope string) (DeviceFlow, error) {
 	devEP, tokEP, err := c.discover(ctx)
 	if err != nil {
 		return DeviceFlow{}, err
 	}
+	if strings.TrimSpace(scope) == "" {
+		scope = Scope
+	}
 	form := url.Values{}
 	form.Set("client_id", ClientID)
-	form.Set("scope", Scope)
+	form.Set("scope", scope)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, devEP, strings.NewReader(form.Encode()))
 	if err != nil {
 		return DeviceFlow{}, err
@@ -1244,29 +1253,31 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, 
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 	var last error
 	// Fresh SSO sessions sometimes need a short settle before device approve sticks.
-	c.log("oauth confirm=browser-only v3 (playwright/chromedp + in-page verify/approve)")
-	c.log("exchange settle 5s (fresh SSO + account activate)")
+	c.log("oauth confirm=browser-only v7 (hydrate Allow + token-only success + scope fallback)")
+	c.log("exchange settle 8s (fresh SSO + account activate)")
 	select {
 	case <-ctx.Done():
 		return Credential{}, ctx.Err()
-	case <-time.After(5 * time.Second):
+	case <-time.After(8 * time.Second):
 	}
-	for attempt := 0; attempt < 3; attempt++ {
+	scopes := []string{Scope, ScopeMinimal}
+	for attempt := 0; attempt < 4; attempt++ {
+		scope := scopes[attempt%len(scopes)]
 		if attempt > 0 {
 			backoff := time.Duration(attempt) * 2 * time.Second
-			c.log("exchange retry %d/3 backoff=%s last=%v", attempt+1, backoff, last)
+			c.log("exchange retry %d/4 backoff=%s scope=%q last=%v", attempt+1, backoff, scope, last)
 			select {
 			case <-ctx.Done():
 				return Credential{}, ctx.Err()
 			case <-time.After(backoff):
 			}
 		} else {
-			c.log("exchange attempt 1/3 start device flow")
+			c.log("exchange attempt 1/4 start device flow scope=%q", scope)
 		}
 		if err := c.WaitRateLimit(ctx); err != nil {
 			return Credential{}, err
 		}
-		flow, err := c.StartDeviceFlow(ctx)
+		flow, err := c.StartDeviceFlowWithScope(ctx, scope)
 		if err != nil {
 			last = err
 			c.log("device flow start fail: %v", err)

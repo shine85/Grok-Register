@@ -69,9 +69,21 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 		}
 	} else {
 		c.log("playwright device_auth fail: %v", err)
+		// Hard token/deny failures must NOT fall through to chromedp —
+		// a second approve pass poisons the same device_code.
+		errS := strings.ToLower(err.Error())
+		if strings.Contains(errS, "invalid_grant") ||
+			strings.Contains(errS, "access denied") ||
+			strings.Contains(errS, "access_denied") ||
+			strings.Contains(errS, "oauth_denied") ||
+			strings.Contains(errS, "clicked deny") ||
+			strings.Contains(errS, "ui_denied") ||
+			strings.Contains(errS, "login_required") {
+			return err
+		}
 	}
 
-	// 2) chromedp fallback
+	// 2) chromedp fallback only for infra/timeouts, not grant denials
 	return c.confirmViaChromedp(ctx, sso, verifyURL, flow)
 }
 
@@ -156,19 +168,7 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 		strings.Contains(lowErr, "last_click=\"form:btn:deny") {
 		return fmt.Errorf("device_auth clicked Deny (refusing fake success)")
 	}
-	if err != nil {
-		if errText == "" {
-			errText = err.Error()
-		}
-		return fmt.Errorf("device_auth: %s", trimLoc(errText))
-	}
-	if !strings.Contains(strings.ToLower(out), "ok") {
-		return fmt.Errorf("device_auth: no ok in stdout (%s)", trimLoc(out+" "+errText))
-	}
-	if !strings.Contains(errText, "v5-no-reapprove") && !strings.Contains(errText, "v4-no-deny") {
-		c.log("device_auth warning: script missing v5 banner (stale image?)")
-	}
-	// Capture TOKEN_JSON from script if in-script poll succeeded.
+	// Always harvest TOKEN_JSON even on non-zero exit (partial success paths).
 	for _, line := range strings.Split(out+"\n"+errText, "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "TOKEN_JSON:") {
@@ -184,6 +184,46 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 			}
 		}
 	}
+	if strings.TrimSpace(c.lastTokenJSON) != "" {
+		// Token already in hand — treat as success even if process exit was weird.
+		return nil
+	}
+	if err != nil {
+		if errText == "" {
+			errText = err.Error()
+		}
+		lowCombo := strings.ToLower(errText + " " + out)
+		if strings.Contains(lowCombo, "ui_done_no_token") || strings.Contains(lowCombo, "api_bound_no_token") {
+			return fmt.Errorf("invalid_grant (Access denied) — UI allowed but token rejected")
+		}
+		return fmt.Errorf("device_auth: %s", trimLoc(errText))
+	}
+	if !strings.Contains(strings.ToLower(out), "ok") {
+		lowCombo := strings.ToLower(out + " " + errText)
+		if strings.Contains(lowCombo, "ui_done_no_token") || strings.Contains(lowCombo, "api_bound_no_token") {
+			return fmt.Errorf("invalid_grant (Access denied) — UI allowed but token rejected")
+		}
+		return fmt.Errorf("device_auth: no ok in stdout (%s)", trimLoc(out+" "+errText))
+	}
+	if !strings.Contains(errText, "v7-hydrate-token") &&
+		!strings.Contains(errText, "v6-explicit-approve") &&
+		!strings.Contains(errText, "v5-no-reapprove") &&
+		!strings.Contains(errText, "v4-no-deny") {
+		c.log("device_auth warning: script missing v7 banner (stale image?)")
+	}
+	if strings.Contains(errText, "ui_done_no_token") || strings.Contains(errText, "api_bound_no_token") {
+		c.log("device_auth UI done but token missing — will probe/fail hard")
+	}
+	if strings.Contains(errText, "approve_req ") {
+		// surface last approve body line for operators
+		for _, line := range strings.Split(errText, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "approve_req ") {
+				c.log("device_auth | %s", line)
+			}
+		}
+	}
+	// TOKEN_JSON already harvested above when present.
 	return nil
 }
 

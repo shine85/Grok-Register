@@ -16,7 +16,7 @@ import sys
 import time
 from urllib.parse import parse_qs, urlparse
 
-DEVICE_AUTH_VERSION = "v6-explicit-approve"
+DEVICE_AUTH_VERSION = "v7-hydrate-token"
 
 
 def find_chrome() -> str:
@@ -130,6 +130,17 @@ def user_code_from_url(url: str) -> str:
     return ""
 
 
+def is_cookie_banner_label(label: str) -> bool:
+    low = (label or "").strip().lower()
+    if not low:
+        return False
+    if "cookie" in low:
+        return True
+    if "accept all" in low or "reject all" in low:
+        return True
+    return False
+
+
 def click_was_deny(last_click: str) -> bool:
     low = (last_click or "").lower()
     return any(x in low for x in ("deny", "cancel", "reject", "decline", "拒绝", "取消"))
@@ -153,7 +164,7 @@ CLICK_JS = r"""
   }
   function isAllow(label){
     const low = (label || "").toLowerCase();
-    const good = ["allow","authorize","approve","accept","grant","允许","授权","批准","同意"];
+    const good = ["allow","authorize","approve","grant","允许","授权","批准","同意"];
     for (let i=0;i<good.length;i++){ if (low === good[i] || low.indexOf(good[i]) >= 0) return true; }
     return false;
   }
@@ -171,7 +182,7 @@ CLICK_JS = r"""
       actionInput.name = 'action';
       f.appendChild(actionInput);
     }
-    actionInput.value = 'allow';
+    actionInput.value = 'accept';
   }
   function pickButton(f){
     var nodes = Array.from(f.querySelectorAll('button, input[type=submit], input[type=button]'));
@@ -244,11 +255,13 @@ CLICK_JS = r"""
 STATUS_JS = r"""
 () => {
   const href = location.href || "";
-  const text = ((document.body && document.body.innerText) || "").slice(0, 800).toLowerCase();
+  const text = ((document.body && document.body.innerText) || "").slice(0, 1200).toLowerCase();
+  let errQ = "";
+  try { errQ = (new URL(href)).searchParams.get("error") || ""; } catch (e) {}
   const done = href.includes("/oauth2/device/done") || href.includes("/device/done");
   const on_approve = href.includes("/oauth2/device/approve") || href.includes("/device/approve");
   const on_consent = href.includes("/consent") || href.includes("/device/consent");
-  const denied =
+  const denied = (errQ && errQ !== "") ||
     text.includes("access denied") || text.includes("request denied") ||
     text.includes("authorization denied") || text.includes("you denied") ||
     text.includes("has been denied") || text.includes("已拒绝") || text.includes("拒绝授权");
@@ -259,7 +272,7 @@ STATUS_JS = r"""
   );
   const login = href.includes("/sign-in") || href.includes("/login") ||
     (text.includes("sign in") && text.includes("password"));
-  return { href, done, authed, denied, login, on_approve, on_consent, sample: text.slice(0, 160) };
+  return { href, done, authed, denied, login, on_approve, on_consent, errQ, sample: text.slice(0, 200) };
 }
 """
 
@@ -351,6 +364,7 @@ def poll_device_token(device_code: str, token_url: str, client_id: str, proxy: s
     if not device_code:
         return None
     try:
+        import urllib.error
         import urllib.parse
         import urllib.request
     except Exception as e:
@@ -361,6 +375,14 @@ def poll_device_token(device_code: str, token_url: str, client_id: str, proxy: s
         "device_code": device_code,
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
     }).encode()
+    handlers = []
+    proxy = (proxy or "").strip()
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        print(f"token_poll using proxy={proxy}", file=sys.stderr)
+    else:
+        handlers.append(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(*handlers)
     for i in range(max(1, attempts)):
         try:
             req = urllib.request.Request(
@@ -373,7 +395,7 @@ def poll_device_token(device_code: str, token_url: str, client_id: str, proxy: s
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with opener.open(req, timeout=15) as resp:
                 raw = resp.read().decode("utf-8", errors="ignore")
                 doc = json.loads(raw or "{}")
                 if doc.get("access_token"):
@@ -435,7 +457,7 @@ async (args) => {
     });
   }
   fields["user_code"] = userCode || fields["user_code"] || "";
-  fields["action"] = "allow";
+  fields["action"] = "accept"; fields["consent"] = "accept";
   fields["principal_type"] = fields["principal_type"] || "User";
   if (principalId) fields["principal_id"] = principalId;
   // Prefer real form submit with allow button
@@ -447,7 +469,10 @@ async (args) => {
       actionInput.name = "action";
       form.appendChild(actionInput);
     }
-    actionInput.value = "allow";
+    actionInput.value = "accept";
+    // also set consent if present
+    let cons = form.querySelector('[name=consent], [name=decision]');
+    if (cons && cons.type !== "submit") cons.value = "accept";
     let uc = form.querySelector('[name=user_code]');
     if (!uc) {
       uc = document.createElement("input");
@@ -462,7 +487,7 @@ async (args) => {
       if (t.includes("deny")||t.includes("cancel")||t.includes("reject")) {
         b.disabled = true; continue;
       }
-      if (t.includes("allow")||t.includes("authorize")||t.includes("approve")||t.includes("accept")) {
+      if (t.includes("allow")||t.includes("authorize")||t.includes("approve")) {
         allowBtn = b; break;
       }
     }
@@ -498,7 +523,7 @@ async (args) => {
 async def playwright_click_allow_or_continue(page) -> str:
     """Prefer real Playwright clicks; never activate Deny/Cancel."""
     # Allow / Authorize first (consent page)
-    allow_names = ("Allow", "Authorize", "Approve", "Accept", "允许", "授权", "批准", "同意")
+    allow_names = ("Allow", "Authorize", "Approve")
     cont_names = ("Continue", "Confirm", "Next", "继续", "确认", "下一步")
     deny_names = ("Deny", "Cancel", "Reject", "Decline", "拒绝", "取消")
 
@@ -520,6 +545,8 @@ async def playwright_click_allow_or_continue(page) -> str:
                                 continue
                             txt = ((await item.inner_text()) or "").strip()
                             low = txt.lower()
+                            if is_cookie_banner_label(txt):
+                                continue
                             if any(d.lower() in low for d in deny_names):
                                 continue
                             await item.click(timeout=2500)
@@ -616,16 +643,34 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 cookies.append({"name": "sso", "value": sso, "url": curl, "secure": True})
             await context.add_cookies(cookies)
 
+            def on_request(req) -> None:
+                try:
+                    u = req.url or ""
+                    if "/oauth2/device/approve" in u and (req.method or "").upper() == "POST":
+                        post = (req.post_data or "")[:300]
+                        print(f"approve_req {post}", file=sys.stderr)
+                except Exception:
+                    pass
+
             def on_response(resp) -> None:
                 try:
                     u = resp.url or ""
                     if "/oauth2/device/" in u:
                         hit_paths.append(f"{resp.status}:{u[:180]}")
-                        if "approve" in u or "done" in u:
-                            print(f"net {resp.status} {u[:200]}", file=sys.stderr)
+                        if "approve" in u or "done" in u or "consent" in u:
+                            loc = ""
+                            try:
+                                loc = resp.headers.get("location") or ""
+                            except Exception:
+                                loc = ""
+                            if loc:
+                                print(f"net {resp.status} {u[:180]} loc={loc[:160]}", file=sys.stderr)
+                            else:
+                                print(f"net {resp.status} {u[:200]}", file=sys.stderr)
                 except Exception:
                     pass
 
+            context.on("request", on_request)
             context.on("response", on_response)
             page = await context.new_page()
 
@@ -670,7 +715,7 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                           a = document.createElement('input');
                           a.type = 'hidden'; a.name = 'action'; f.appendChild(a);
                         }
-                        a.value = 'allow';
+                        a.value = 'accept';
                         // disable deny buttons so accidental submit cannot deny
                         f.querySelectorAll('button, input[type=submit], input[type=button]').forEach(b => {
                           const t = ((b.innerText || b.textContent || b.value || '')+'').toLowerCase();
@@ -684,33 +729,86 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 except Exception:
                     pass
 
-                # If already on consent, prefer explicit allow submit (binds device_code for real).
+                # Consent: hydrate, then REAL Playwright Allow first (correct button value).
+                # explicit_allow only if native click did not navigate to approve/done.
                 href_pre = page.url or ""
                 if "/consent" in href_pre or "/approve" in href_pre:
-                    try:
-                        ex = await explicit_allow_on_consent(page, user_code, principal)
-                        if ex:
-                            last_click = ex
-                            print(f"explicit_allow[{ticks}] {ex!r}", file=sys.stderr)
+                    if ticks <= 3:
+                        try:
+                            await page.get_by_role("button", name="Allow", exact=True).wait_for(state="visible", timeout=6000)
+                        except Exception:
+                            pass
+                        if ticks == 1:
+                            await asyncio.sleep(1.8)
+                            print(f"consent_hydrate tick={ticks} href={href_pre[:120]}", file=sys.stderr)
                             try:
-                                await page.wait_for_load_state("domcontentloaded", timeout=8000)
-                            except Exception:
-                                pass
-                            await asyncio.sleep(1.2)
-                    except Exception as e:
-                        print(f"explicit_allow err: {e}", file=sys.stderr)
+                                dumps = await page.evaluate(
+                                    """() => Array.from(document.querySelectorAll('form')).slice(0,3).map(f => ({
+                                      action: (f.getAttribute('action')||'').slice(0,80),
+                                      fields: Array.from(f.elements).slice(0,12).map(el => ({
+                                        name: el.name||'', type: el.type||'',
+                                        value: ((el.value||'')+'').slice(0,40),
+                                        text: ((el.innerText||el.textContent||'')+'').trim().slice(0,30)
+                                      }))
+                                    }))"""
+                                )
+                                print(f"forms_dump {json.dumps(dumps, ensure_ascii=False)[:500]}", file=sys.stderr)
+                            except Exception as e:
+                                print(f"forms_dump err: {e}", file=sys.stderr)
+                        # Native Allow gesture first
+                        try:
+                            native = await playwright_click_allow_or_continue(page)
+                            if native and not is_cookie_banner_label(native) and "allow" in native.lower():
+                                last_click = native
+                                print(f"native_allow[{ticks}] {native!r}", file=sys.stderr)
+                                try:
+                                    await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(1.2)
+                        except Exception as e:
+                            print(f"native_allow err: {e}", file=sys.stderr)
+                    # Fallback explicit form only if still on consent
+                    href_mid = page.url or ""
+                    if ("/consent" in href_mid or "/approve" in href_mid) and not any("done" in h for h in hit_paths[-6:]):
+                        try:
+                            ex = await explicit_allow_on_consent(page, user_code, principal)
+                            if ex:
+                                last_click = ex
+                                print(f"explicit_allow[{ticks}] {ex!r}", file=sys.stderr)
+                                try:
+                                    await page.wait_for_load_state("domcontentloaded", timeout=8000)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(1.2)
+                        except Exception as e:
+                            print(f"explicit_allow err: {e}", file=sys.stderr)
 
                 clicked = ""
-                try:
-                    clicked = await playwright_click_allow_or_continue(page)
-                except Exception as e:
-                    print(f"pw click err: {e}", file=sys.stderr)
-                    clicked = ""
-                if not clicked:
+                skip_click = False
+                low_last = (last_click or "").lower()
+                if (
+                    ("allow" in low_last or "explicit" in low_last or "authorize" in low_last or "approve" in low_last)
+                    and not is_cookie_banner_label(last_click or "")
+                    and any(("approve" in h) or ("done" in h) for h in hit_paths[-8:])
+                ):
+                    skip_click = True
+                    print(f"skip_post_allow_click last={last_click!r}", file=sys.stderr)
+                if not skip_click:
                     try:
-                        clicked = await page.evaluate(CLICK_JS)
+                        clicked = await playwright_click_allow_or_continue(page)
                     except Exception as e:
-                        print(f"click eval err: {e}", file=sys.stderr)
+                        print(f"pw click err: {e}", file=sys.stderr)
+                        clicked = ""
+                    if not clicked:
+                        try:
+                            clicked = await page.evaluate(CLICK_JS)
+                        except Exception as e:
+                            print(f"click eval err: {e}", file=sys.stderr)
+                            clicked = ""
+                    # Never accept cookie banner as an OAuth click success
+                    if clicked and is_cookie_banner_label(clicked):
+                        print(f"ignore_cookie_click {clicked!r}", file=sys.stderr)
                         clicked = ""
                 if clicked:
                     last_click = clicked
@@ -741,15 +839,23 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 allowed_click = ("allow" in (last_click or "").lower()) and not click_was_deny(last_click)
 
                 if done:
-                    print(f"ui_success href={href[:160]} last_click={last_click!r} api_bound={api_bound}", file=sys.stderr)
+                    err_q = (st or {}).get("errQ") or ""
+                    print(f"ui_success href={href[:160]} last_click={last_click!r} api_bound={api_bound} errQ={err_q!r} sample={((st or {}).get('sample') or '')[:120]!r}", file=sys.stderr)
                     if hit_paths:
                         print(f"net_hits {hit_paths[-8:]}", file=sys.stderr)
-                    # Optional in-script token poll (avoids Go tls-client mismatch).
-                    print("token_poll waiting 2s after allow/done...", file=sys.stderr); time.sleep(2.0); tok = poll_device_token(device_code, token_url, client_id, proxy, attempts=12)
-                    if tok:
+                    if err_q or (st or {}).get("denied"):
+                        print(f"ui_denied_on_done errQ={err_q!r}", file=sys.stderr)
+                        return 1
+                    # Token is the only success — never fake ok on UI done alone.
+                    print("token_poll waiting 2.5s after allow/done...", file=sys.stderr)
+                    time.sleep(2.5)
+                    tok = poll_device_token(device_code, token_url, client_id, proxy, attempts=15)
+                    if tok and tok.get("access_token"):
                         print("TOKEN_JSON:" + json.dumps(tok, ensure_ascii=False))
-                    print("ok")
-                    return 0
+                        print("ok")
+                        return 0
+                    print("ui_done_no_token — refusing fake ok", file=sys.stderr)
+                    return 2
 
                 # api_auth ONLY if stuck on consent with no Allow yet — never after Allow/done.
                 if (
@@ -773,11 +879,15 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
 
                 if api_bound and not click_was_deny(last_click):
                     print(f"api_bound success last_click={last_click!r}", file=sys.stderr)
-                    print("token_poll waiting 2s after allow/done...", file=sys.stderr); time.sleep(2.0); tok = poll_device_token(device_code, token_url, client_id, proxy, attempts=12)
-                    if tok:
+                    print("token_poll waiting 2.5s after allow/done...", file=sys.stderr)
+                    time.sleep(2.5)
+                    tok = poll_device_token(device_code, token_url, client_id, proxy, attempts=15)
+                    if tok and tok.get("access_token"):
                         print("TOKEN_JSON:" + json.dumps(tok, ensure_ascii=False))
-                    print("ok")
-                    return 0
+                        print("ok")
+                        return 0
+                    print("api_bound_no_token — refusing fake ok", file=sys.stderr)
+                    return 2
 
                 if (st or {}).get("login") or ("/account" in href and "device" not in href):
                     print(f"session_page href={href[:160]} — re-open device url", file=sys.stderr)
@@ -798,8 +908,8 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
             try:
                 st = await page.evaluate(STATUS_JS)
                 if ((st or {}).get("done") or (st or {}).get("authed") or api_bound) and not click_was_deny(last_click):
-                    print("ok")
-                    return 0
+                    print("timeout_ui_done_without_token_poll — fail", file=sys.stderr)
+                    return 2
                 print(
                     f"timeout href={(st or {}).get('href', page.url)!r} last_click={last_click!r} "
                     f"api_bound={api_bound} sample={(st or {}).get('sample', '')!r}",
@@ -811,8 +921,8 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 print(f"net_hits {hit_paths[-8:]}", file=sys.stderr)
             good_net = any(("done" in h) and h.startswith(("200:", "303:", "302:")) for h in hit_paths)
             if good_net and api_bound and not click_was_deny(last_click):
-                print("ok")
-                return 0
+                print("timeout_good_net_no_token — fail", file=sys.stderr)
+                return 2
             return 1
         finally:
             await browser.close()
