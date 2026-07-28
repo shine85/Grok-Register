@@ -399,6 +399,15 @@ func (e *Engine) run(ctx context.Context) error {
 		return err
 	}
 	e.attachOAuthLogger()
+	{
+		py := oauth.DeviceAuthPython()
+		script := oauth.DeviceAuthScript()
+		if script == "" || py == "" {
+			log.Warnf("OAuth device confirm=browser-only but missing tooling py=%q script=%q (CPA auto may fail at OAuth)", py, script)
+		} else {
+			log.Infof("OAuth device confirm=browser-only v2 py=%s script=%s", py, script)
+		}
+	}
 
 	_ = st.Set(func(s *state.Snapshot) {
 		s.Phase = state.PhaseRegister

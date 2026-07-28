@@ -141,6 +141,10 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 	return nil
 }
 
+// DeviceAuthPython/Script expose resolved paths for startup logs.
+func DeviceAuthPython() string { return findDeviceAuthPython() }
+func DeviceAuthScript() string { return findDeviceAuthScript() }
+
 func findDeviceAuthPython() string {
 	for _, name := range []string{
 		os.Getenv("GROK_PYTHON"),
