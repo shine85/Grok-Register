@@ -59,6 +59,7 @@ type Credential struct {
 type Client struct {
 	http  tls_client.HttpClient
 	ua    string
+	proxy string
 	clear *clearance.Manager
 	logf  func(string, ...any)
 
