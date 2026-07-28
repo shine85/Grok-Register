@@ -63,6 +63,9 @@ type Client struct {
 	clear *clearance.Manager
 	logf  func(string, ...any)
 
+	// lastTokenJSON set when device_auth.py returns TOKEN_JSON after Allow.
+	lastTokenJSON string
+
 	// rate limit gate
 	mu         sync.Mutex
 	trippedAt  time.Time
@@ -118,6 +121,17 @@ func NewClient(proxy string, cm *clearance.Manager, baseCooldown time.Duration) 
 }
 
 // SetLogger attaches optional progress logs (e.g. pipeline logx).
+func (c *Client) takeLastTokenJSON() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := c.lastTokenJSON
+	c.lastTokenJSON = ""
+	return s
+}
+
 func (c *Client) SetLogger(fn func(string, ...any)) {
 	if c == nil {
 		return
@@ -1277,6 +1291,15 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 			return Credential{}, err
 		}
 		// Confirm looked good — only wait briefly for token propagation.
+		if raw := strings.TrimSpace(c.takeLastTokenJSON()); raw != "" {
+			var doc map[string]any
+			if json.Unmarshal([]byte(raw), &doc) == nil {
+				if cred, cerr := credentialFrom(doc, flow.TokenEndpoint); cerr == nil {
+					c.log("exchange ok via device_auth TOKEN_JSON")
+					return cred, nil
+				}
+			}
+		}
 		c.log("confirm ok, polling token (max 45s)…")
 		cred, err := c.pollTokenLimited(ctx, flow, 45*time.Second)
 		if err != nil {

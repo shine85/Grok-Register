@@ -16,7 +16,7 @@ import sys
 import time
 from urllib.parse import parse_qs, urlparse
 
-DEVICE_AUTH_VERSION = "v4-no-deny"
+DEVICE_AUTH_VERSION = "v5-no-reapprove"
 
 
 def find_chrome() -> str:
@@ -342,6 +342,64 @@ async ({ userCode, principalId }) => {
 """
 
 
+
+def poll_device_token(device_code: str, token_url: str, client_id: str, attempts: int = 8):
+    """Exchange device_code at token endpoint after UI allow. No browser cookies required."""
+    device_code = (device_code or "").strip()
+    token_url = (token_url or "").strip() or "https://auth.x.ai/oauth2/token"
+    client_id = (client_id or "").strip() or "b1a00492-073a-47ea-816f-4c329264a828"
+    if not device_code:
+        return None
+    try:
+        import urllib.parse
+        import urllib.request
+    except Exception as e:
+        print(f"token poll import err: {e}", file=sys.stderr)
+        return None
+    body = urllib.parse.urlencode({
+        "client_id": client_id,
+        "device_code": device_code,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+    }).encode()
+    for i in range(max(1, attempts)):
+        try:
+            req = urllib.request.Request(
+                token_url,
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+                doc = json.loads(raw or "{}")
+                if doc.get("access_token"):
+                    print(f"token_poll ok attempt={i+1}", file=sys.stderr)
+                    return doc
+                print(f"token_poll unexpected attempt={i+1} body={raw[:160]}", file=sys.stderr)
+        except Exception as e:
+            err_body = ""
+            try:
+                import urllib.error
+                if isinstance(e, urllib.error.HTTPError) and e.fp is not None:
+                    err_body = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            low = (err_body or str(e)).lower()
+            print(f"token_poll attempt={i+1} err={e} body={err_body[:200]}", file=sys.stderr)
+            if "authorization_pending" in low or "slow_down" in low:
+                time.sleep(2.0)
+                continue
+            if "invalid_grant" in low or "access_denied" in low:
+                return None
+            time.sleep(1.5)
+            continue
+        time.sleep(1.5)
+    return None
+
 async def playwright_click_allow_or_continue(page) -> str:
     """Prefer real Playwright clicks; never activate Deny/Cancel."""
     # Allow / Authorize first (consent page)
@@ -401,7 +459,7 @@ async def playwright_click_allow_or_continue(page) -> str:
         return ""
     return await try_names(cont_names, "pw-continue")
 
-async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode: str, user_code: str) -> int:
+async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode: str, user_code: str, device_code: str = "", token_url: str = "", client_id: str = "") -> int:
     try:
         from playwright.async_api import async_playwright
     except Exception as e:
@@ -420,8 +478,8 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
     label, headless = resolve_mode(mode)
     print(
         f"device_auth {DEVICE_AUTH_VERSION} chrome={chrome} mode={label} headless={headless} "
-        f"user_code={user_code or '-'} principal={principal[:24] or '-'} "
-        f"claims={keys or '-'} url={url[:120]}",
+        f"user_code={user_code or '-'} device_code={('yes' if device_code else 'no')} "
+        f"principal={principal[:24] or '-'} claims={keys or '-'} url={url[:120]}",
         file=sys.stderr,
     )
 
@@ -546,19 +604,7 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                         pass
                     await asyncio.sleep(1.0)
 
-                href_now = page.url or ""
-                on_device_stage = any(x in href_now for x in ("/consent", "/approve", "/device/done", "user_code="))
-                if user_code and on_device_stage and api_attempts < 5 and (ticks in (2, 3, 5) or ticks % 5 == 0):
-                    api_attempts += 1
-                    try:
-                        results = await page.evaluate(API_AUTH_JS, {"userCode": user_code, "principalId": principal})
-                        print(f"api_auth[{api_attempts}] {json.dumps(results, ensure_ascii=False)[:320]}", file=sys.stderr)
-                        for row in results or []:
-                            if isinstance(row, dict) and row.get("step") == "approve" and row.get("okish"):
-                                api_bound = True
-                    except Exception as e:
-                        print(f"api_auth err: {e}", file=sys.stderr)
-
+                # Status FIRST — never re-approve after /done (re-POST poisons device_code → invalid_grant).
                 try:
                     st = await page.evaluate(STATUS_JS)
                 except Exception as e:
@@ -572,15 +618,46 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
 
                 done = bool((st or {}).get("done") or (st or {}).get("authed"))
                 on_consent = bool((st or {}).get("on_consent"))
-                if done or api_bound:
-                    if on_consent and not done and not api_bound:
-                        print(f"on_consent waiting allow href={href[:120]}", file=sys.stderr)
-                    else:
-                        print(f"ui_success href={href[:160]} last_click={last_click!r} api_bound={api_bound}", file=sys.stderr)
-                        if hit_paths:
-                            print(f"net_hits {hit_paths[-8:]}", file=sys.stderr)
-                        print("ok")
-                        return 0
+                allowed_click = ("allow" in (last_click or "").lower()) and not click_was_deny(last_click)
+
+                if done:
+                    print(f"ui_success href={href[:160]} last_click={last_click!r} api_bound={api_bound}", file=sys.stderr)
+                    if hit_paths:
+                        print(f"net_hits {hit_paths[-8:]}", file=sys.stderr)
+                    # Optional in-script token poll (avoids Go tls-client mismatch).
+                    tok = poll_device_token(device_code, token_url, client_id)
+                    if tok:
+                        print("TOKEN_JSON:" + json.dumps(tok, ensure_ascii=False))
+                    print("ok")
+                    return 0
+
+                # api_auth ONLY if stuck on consent with no Allow yet — never after Allow/done.
+                if (
+                    user_code
+                    and on_consent
+                    and not allowed_click
+                    and not done
+                    and api_attempts < 3
+                    and ticks >= 6
+                    and ticks % 4 == 0
+                ):
+                    api_attempts += 1
+                    try:
+                        results = await page.evaluate(API_AUTH_JS, {"userCode": user_code, "principalId": principal})
+                        print(f"api_auth[{api_attempts}] {json.dumps(results, ensure_ascii=False)[:320]}", file=sys.stderr)
+                        for row in results or []:
+                            if isinstance(row, dict) and row.get("step") == "approve" and row.get("okish"):
+                                api_bound = True
+                    except Exception as e:
+                        print(f"api_auth err: {e}", file=sys.stderr)
+
+                if api_bound and not click_was_deny(last_click):
+                    print(f"api_bound success last_click={last_click!r}", file=sys.stderr)
+                    tok = poll_device_token(device_code, token_url, client_id)
+                    if tok:
+                        print("TOKEN_JSON:" + json.dumps(tok, ensure_ascii=False))
+                    print("ok")
+                    return 0
 
                 if (st or {}).get("login") or ("/account" in href and "device" not in href):
                     print(f"session_page href={href[:160]} — re-open device url", file=sys.stderr)
@@ -626,6 +703,9 @@ def main() -> int:
     ap.add_argument("--url", required=True)
     ap.add_argument("--sso", required=True)
     ap.add_argument("--user-code", default="")
+    ap.add_argument("--device-code", default="")
+    ap.add_argument("--token-url", default="")
+    ap.add_argument("--client-id", default="")
     ap.add_argument("--proxy", default="")
     ap.add_argument("--chrome", default="")
     ap.add_argument("--timeout", type=float, default=70)
@@ -646,6 +726,9 @@ def main() -> int:
                 timeout=float(args.timeout),
                 mode=(args.mode or "headless"),
                 user_code=(args.user_code or "").strip(),
+                device_code=(args.device_code or "").strip(),
+                token_url=(args.token_url or "").strip(),
+                client_id=(args.client_id or "").strip(),
             )
         )
     except Exception as e:

@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"bytes"
+	"encoding/json"
 	"context"
 	"fmt"
 	"os"
@@ -37,7 +38,13 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	}
 
 	// 1) Playwright script (preferred in Docker).
-	if err := c.confirmViaPlaywright(ctx, sso, verifyURL, userCode); err == nil {
+	if err := c.confirmViaPlaywright(ctx, sso, verifyURL, flow); err == nil {
+		// Script may have already exchanged device_code (TOKEN_JSON).
+		if strings.TrimSpace(c.lastTokenJSON) != "" {
+			c.log("browser confirm ok via device_auth TOKEN_JSON")
+			c.ClearRateLimit()
+			return nil
+		}
 		if code, perr := c.probeTokenOnce(ctx, flow); perr == nil && code == "" {
 			c.log("browser confirm ok via playwright+token")
 			c.ClearRateLimit()
@@ -68,7 +75,8 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	return c.confirmViaChromedp(ctx, sso, verifyURL, flow)
 }
 
-func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL, userCode string) error {
+func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string, flow DeviceFlow) error {
+	userCode := strings.TrimSpace(flow.UserCode)
 	py := findDeviceAuthPython()
 	script := findDeviceAuthScript()
 	if py == "" {
@@ -91,6 +99,15 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL, userC
 	if userCode != "" {
 		args = append(args, "--user-code", userCode)
 	}
+	if dc := strings.TrimSpace(flow.DeviceCode); dc != "" {
+		args = append(args, "--device-code", dc)
+	}
+	tokURL := strings.TrimSpace(flow.TokenEndpoint)
+	if tokURL == "" {
+		tokURL = "https://auth.x.ai/oauth2/token"
+	}
+	args = append(args, "--token-url", tokURL)
+	args = append(args, "--client-id", ClientID)
 	if strings.TrimSpace(c.proxy) != "" {
 		args = append(args, "--proxy", strings.TrimSpace(c.proxy))
 	}
@@ -148,8 +165,24 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL, userC
 	if !strings.Contains(strings.ToLower(out), "ok") {
 		return fmt.Errorf("device_auth: no ok in stdout (%s)", trimLoc(out+" "+errText))
 	}
-	if !strings.Contains(errText, "v4-no-deny") && !strings.Contains(errText, "DEVICE_AUTH_VERSION") {
-		c.log("device_auth warning: script missing v4-no-deny banner (stale image?)")
+	if !strings.Contains(errText, "v5-no-reapprove") && !strings.Contains(errText, "v4-no-deny") {
+		c.log("device_auth warning: script missing v5 banner (stale image?)")
+	}
+	// Capture TOKEN_JSON from script if in-script poll succeeded.
+	for _, line := range strings.Split(out+"\n"+errText, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "TOKEN_JSON:") {
+			raw := strings.TrimSpace(strings.TrimPrefix(line, "TOKEN_JSON:"))
+			var doc map[string]any
+			if json.Unmarshal([]byte(raw), &doc) == nil {
+				if at, _ := doc["access_token"].(string); strings.TrimSpace(at) != "" {
+					c.log("device_auth returned access_token len=%d", len(at))
+					c.mu.Lock()
+					c.lastTokenJSON = raw
+					c.mu.Unlock()
+				}
+			}
+		}
 	}
 	return nil
 }
