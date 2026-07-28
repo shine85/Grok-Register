@@ -16,7 +16,7 @@ import sys
 import time
 from urllib.parse import parse_qs, urlparse
 
-DEVICE_AUTH_VERSION = "v7-hydrate-token"
+DEVICE_AUTH_VERSION = "v8-session-bind"
 
 
 def find_chrome() -> str:
@@ -57,8 +57,21 @@ def resolve_mode(mode: str) -> tuple[str, bool]:
 
 
 def launch_args(label: str) -> list[str]:
-    args = ["--no-sandbox", "--disable-blink-features=AutomationControlled", "--no-first-run",
-            "--no-default-browser-check", "--disable-infobars", "--disable-dev-shm-usage"]
+    args = [
+        "--no-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--no-zygote",
+        "--renderer-process-limit=2",
+    ]
     if label == "offscreen":
         args.extend(["--window-position=-2400,-2400", "--window-size=1280,800"])
     return args
@@ -520,6 +533,205 @@ async (args) => {
     except Exception as e:
         return f"explicit_err:{e}"
 
+
+EXTRACT_PRINCIPAL_JS = r"""
+async () => {
+  const out = { principal: "", sources: [] };
+  function take(obj, path) {
+    try {
+      let cur = obj;
+      for (const k of path) {
+        if (cur == null) return "";
+        cur = cur[k];
+      }
+      if (cur == null) return "";
+      const s = String(cur).trim();
+      return s;
+    } catch (e) { return ""; }
+  }
+  function scan(obj, label) {
+    if (!obj || typeof obj !== "object") return;
+    const keys = ["sub","user_id","userId","id","principal_id","principalId","account_id","accountId","uid"];
+    for (const k of keys) {
+      if (obj[k] != null && String(obj[k]).trim()) {
+        out.principal = String(obj[k]).trim();
+        out.sources.push(label + "." + k);
+        return true;
+      }
+    }
+    for (const nest of ["user","account","identity","profile","data","session","payload"]) {
+      if (obj[nest] && typeof obj[nest] === "object") {
+        for (const k of keys) {
+          if (obj[nest][k] != null && String(obj[nest][k]).trim()) {
+            out.principal = String(obj[nest][k]).trim();
+            out.sources.push(label + "." + nest + "." + k);
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+  // next data
+  try {
+    if (window.__NEXT_DATA__) {
+      scan(window.__NEXT_DATA__, "next");
+      if (!out.principal) scan((window.__NEXT_DATA__.props||{}).pageProps||{}, "next.pageProps");
+    }
+  } catch (e) {}
+  // common globals
+  for (const g of ["__USER__", "__SESSION__"]) {}
+  try {
+    if (window.__USER__) scan(window.__USER__, "user");
+  } catch (e) {}
+  // fetch session endpoints
+  const urls = [
+    "https://accounts.x.ai/api/auth/session",
+    "https://accounts.x.ai/api/session",
+    "https://accounts.x.ai/api/user",
+    "https://accounts.x.ai/api/me",
+    "https://auth.x.ai/api/auth/session",
+  ];
+  for (const u of urls) {
+    try {
+      const resp = await fetch(u, { credentials: "include", headers: { "Accept": "application/json" } });
+      const txt = await resp.text();
+      out.sources.push("fetch:" + u + ":" + resp.status + ":" + (txt||"").replace(/\s+/g," ").slice(0,80));
+      try {
+        const j = JSON.parse(txt || "{}");
+        if (scan(j, u)) break;
+      } catch (e) {}
+    } catch (e) {
+      out.sources.push("fetch_err:" + u + ":" + String(e).slice(0,60));
+    }
+  }
+  // cookie jwt scan via document.cookie is limited (httpOnly). skip.
+  return out;
+}
+"""
+
+
+async def extract_principal(page) -> str:
+    try:
+        res = await page.evaluate(EXTRACT_PRINCIPAL_JS)
+    except Exception as e:
+        print(f"principal extract err: {e}", file=sys.stderr)
+        return ""
+    if isinstance(res, dict):
+        prin = (res.get("principal") or "").strip()
+        src = res.get("sources") or []
+        print(f"principal_extract principal={prin[:36] or '-'} sources={json.dumps(src, ensure_ascii=False)[:240]}", file=sys.stderr)
+        return prin
+    return ""
+
+
+
+async def dismiss_cookie_banner(page) -> str:
+    names = (
+        "Accept All Cookies", "Accept all cookies", "Accept All", "Accept all",
+        "Got it", "I understand", "Close",
+    )
+    for name in names:
+        try:
+            loc = page.get_by_role("button", name=name, exact=False)
+            n = await loc.count()
+            for i in range(min(n, 3)):
+                item = loc.nth(i)
+                if await item.is_visible():
+                    txt = ((await item.inner_text()) or name).strip()
+                    await item.click(timeout=1500)
+                    return f"cookie:{txt[:40]}"
+        except Exception:
+            continue
+    try:
+        loc = page.get_by_text("Accept All Cookies", exact=False)
+        if await loc.count() > 0 and await loc.first.is_visible():
+            await loc.first.click(timeout=1500)
+            return "cookie:text-Accept All Cookies"
+    except Exception:
+        pass
+    return ""
+
+
+async def browser_password_login(page, email: str, password: str) -> str:
+    """Best-effort accounts.x.ai email/password login to bind a full session."""
+    email = (email or "").strip()
+    password = (password or "").strip()
+    if not email or not password:
+        return "skip-no-creds"
+    try:
+        print("device_auth password_login start", file=sys.stderr)
+        await page.goto("https://accounts.x.ai/sign-in", wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(1.0)
+        await dismiss_cookie_banner(page)
+        # email field
+        filled_email = False
+        for sel in ('input[type="email"]', 'input[name="email"]', 'input[name="username"]', 'input[autocomplete="username"]'):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.fill(email)
+                    filled_email = True
+                    break
+            except Exception:
+                continue
+        if not filled_email:
+            # generic text input
+            try:
+                loc = page.locator("input[placeholder*=email i], input[placeholder*=Email i], input[placeholder*=user i]").first
+                if await loc.count() > 0:
+                    await loc.fill(email)
+                    filled_email = True
+            except Exception:
+                pass
+        # continue / next
+        for name in ("Continue", "Next", "Sign in", "Log in", "继续"):
+            try:
+                btn = page.get_by_role("button", name=name, exact=False)
+                if await btn.count() > 0 and await btn.first.is_visible():
+                    await btn.first.click(timeout=2000)
+                    await asyncio.sleep(1.2)
+                    break
+            except Exception:
+                continue
+        # password
+        filled_pw = False
+        for sel in ('input[type="password"]', 'input[name="password"]', 'input[autocomplete="current-password"]'):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.fill(password)
+                    filled_pw = True
+                    break
+            except Exception:
+                continue
+        if filled_pw:
+            for name in ("Sign in", "Log in", "Continue", "Next", "登录", "登入"):
+                try:
+                    btn = page.get_by_role("button", name=name, exact=False)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        txt = ((await btn.first.inner_text()) or name).strip()
+                        if is_deny_label(txt) or is_cookie_banner_label(txt):
+                            continue
+                        await btn.first.click(timeout=2500)
+                        break
+                except Exception:
+                    continue
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+        href = page.url or ""
+        print(f"password_login done href={href[:160]} email_filled={filled_email} pw_filled={filled_pw}", file=sys.stderr)
+        return f"login:{href[:80]}"
+    except Exception as e:
+        print(f"password_login err: {e}", file=sys.stderr)
+        return f"login_err:{e}"
+
+
+
+
 async def playwright_click_allow_or_continue(page) -> str:
     """Prefer real Playwright clicks; never activate Deny/Cancel."""
     # Allow / Authorize first (consent page)
@@ -581,7 +793,7 @@ async def playwright_click_allow_or_continue(page) -> str:
         return ""
     return await try_names(cont_names, "pw-continue")
 
-async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode: str, user_code: str, device_code: str = "", token_url: str = "", client_id: str = "") -> int:
+async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode: str, user_code: str, device_code: str = "", token_url: str = "", client_id: str = "", email: str = "", password: str = "") -> int:
     try:
         from playwright.async_api import async_playwright
     except Exception as e:
@@ -688,6 +900,23 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                 except Exception as e:
                     print(f"warm err {warm_url}: {e}", file=sys.stderr)
 
+            # Bind full session identity (principal) before device grant.
+            if not principal:
+                principal = await extract_principal(page)
+            if (not principal) and email and password:
+                await browser_password_login(page, email, password)
+                # re-warm account home
+                try:
+                    await page.goto("https://accounts.x.ai/account", wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    print(f"post-login warm err: {e}", file=sys.stderr)
+                principal = await extract_principal(page) or principal
+            if principal:
+                print(f"device_auth principal_ready={principal[:36]}", file=sys.stderr)
+            else:
+                print("device_auth principal still empty after warm/login", file=sys.stderr)
+
             print(f"device_auth open verify url={url[:140]}", file=sys.stderr)
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -755,6 +984,34 @@ async def run(url: str, sso: str, proxy: str, chrome: str, timeout: float, mode:
                                 print(f"forms_dump {json.dumps(dumps, ensure_ascii=False)[:500]}", file=sys.stderr)
                             except Exception as e:
                                 print(f"forms_dump err: {e}", file=sys.stderr)
+                        # Inject principal into consent form fields before Allow.
+                        if principal:
+                            try:
+                                inj = await page.evaluate(
+                                    """(pid) => {
+                                      let n = 0;
+                                      document.querySelectorAll("form").forEach(f => {
+                                        let p = f.querySelector("[name=principal_id], [name=principalId]");
+                                        if (!p) {
+                                          p = document.createElement("input");
+                                          p.type = "hidden"; p.name = "principal_id"; f.appendChild(p);
+                                        }
+                                        p.value = pid;
+                                        let pt = f.querySelector("[name=principal_type]");
+                                        if (!pt) {
+                                          pt = document.createElement("input");
+                                          pt.type = "hidden"; pt.name = "principal_type"; f.appendChild(pt);
+                                        }
+                                        pt.value = "User";
+                                        n++;
+                                      });
+                                      return n;
+                                    }""",
+                                    principal,
+                                )
+                                print(f"principal_inject forms={inj} id={principal[:36]}", file=sys.stderr)
+                            except Exception as e:
+                                print(f"principal_inject err: {e}", file=sys.stderr)
                         # Native Allow gesture first
                         try:
                             native = await playwright_click_allow_or_continue(page)
@@ -940,6 +1197,8 @@ def main() -> int:
     ap.add_argument("--chrome", default="")
     ap.add_argument("--timeout", type=float, default=70)
     ap.add_argument("--mode", default=os.environ.get("OAUTH_BROWSER_MODE", "headless"))
+    ap.add_argument("--email", default="")
+    ap.add_argument("--password", default="")
     args = ap.parse_args()
     url = (args.url or "").strip()
     sso = (args.sso or "").strip()
@@ -959,6 +1218,8 @@ def main() -> int:
                 device_code=(args.device_code or "").strip(),
                 token_url=(args.token_url or "").strip(),
                 client_id=(args.client_id or "").strip(),
+                email=(args.email or "").strip(),
+                password=(args.password or "").strip(),
             )
         )
     except Exception as e:

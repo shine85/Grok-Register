@@ -879,7 +879,7 @@ func (e *Engine) cWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		case <-ctx.Done():
 			e.releaseReserve()
 			return
-		case <-time.After(8 * time.Second):
+		case <-time.After(15 * time.Second):
 		}
 
 		job := SSOJob{Email: q.Email, Password: q.Password, SSO: sso}
@@ -984,7 +984,7 @@ func (e *Engine) oauthWorker(ctx context.Context, id int) {
 		}
 
 		log.Infof("[oauth] start local device exchange email=%s", job.Email)
-		cred, err := e.oauth.Exchange(ctx, job.SSO)
+		cred, err := e.oauth.ExchangeAccount(ctx, job.SSO, job.Email, job.Password)
 		if err != nil {
 			log.Warnf("OAuth fail %s: %v (%.1fs) sso=%s", job.Email, err, time.Since(t0).Seconds(), ssoPrev)
 			e.fail.Add(1)

@@ -1251,14 +1251,18 @@ func (c *Client) Refresh(ctx context.Context, refreshToken string) (Credential, 
 // retry with a fresh device code. Post-confirm poll is capped so one attempt cannot hang
 // for the full device ExpiresIn (often 15m) and look "stuck" after → OAuth.
 func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
+	return c.ExchangeAccount(ctx, sso, "", "")
+}
+
+func (c *Client) ExchangeAccount(ctx context.Context, sso, email, password string) (Credential, error) {
 	var last error
 	// Fresh SSO sessions sometimes need a short settle before device approve sticks.
-	c.log("oauth confirm=browser-only v7 (hydrate Allow + token-only success + scope fallback)")
-	c.log("exchange settle 8s (fresh SSO + account activate)")
+	c.log("oauth confirm=browser-only v8 (session bind + password login + token-only)")
+	c.log("exchange settle 12s (fresh SSO + account activate)")
 	select {
 	case <-ctx.Done():
 		return Credential{}, ctx.Err()
-	case <-time.After(8 * time.Second):
+	case <-time.After(12 * time.Second):
 	}
 	scopes := []string{Scope, ScopeMinimal}
 	for attempt := 0; attempt < 4; attempt++ {
@@ -1292,7 +1296,7 @@ func (c *Client) Exchange(ctx context.Context, sso string) (Credential, error) {
 		c.log("device flow ok user_code=%s verify=%s expires_in=%d", flow.UserCode, trimLoc(flow.VerificationURL), flow.ExpiresIn)
 		// accounts.x.ai device UX is a JS SPA — browser confirm ONLY.
 		// HTTP form fallback poisons device codes (307 /account, then invalid_grant).
-		err = c.ConfirmBrowser(ctx, sso, flow)
+		err = c.ConfirmBrowser(ctx, sso, flow, email, password)
 		if err != nil {
 			last = err
 			c.log("confirm fail: %v", err)

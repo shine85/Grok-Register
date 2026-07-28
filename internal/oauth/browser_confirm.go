@@ -22,7 +22,7 @@ import (
 // Primary: Playwright+CloakBrowser script (same stack as turnstile).
 // Fallback: chromedp against the same Chrome binary.
 // Pure HTTP form posts only 307 to /account and never bind the device_code.
-func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow) error {
+func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow, email, password string) error {
 	c.log("browser confirm enter user_code=%s", strings.TrimSpace(flow.UserCode))
 	sso = strings.TrimSpace(sso)
 	if sso == "" {
@@ -38,7 +38,7 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	}
 
 	// 1) Playwright script (preferred in Docker).
-	if err := c.confirmViaPlaywright(ctx, sso, verifyURL, flow); err == nil {
+	if err := c.confirmViaPlaywright(ctx, sso, verifyURL, flow, email, password); err == nil {
 		// Script may have already exchanged device_code (TOKEN_JSON).
 		if strings.TrimSpace(c.lastTokenJSON) != "" {
 			c.log("browser confirm ok via device_auth TOKEN_JSON")
@@ -87,7 +87,7 @@ func (c *Client) ConfirmBrowser(ctx context.Context, sso string, flow DeviceFlow
 	return c.confirmViaChromedp(ctx, sso, verifyURL, flow)
 }
 
-func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string, flow DeviceFlow) error {
+func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string, flow DeviceFlow, email, password string) error {
 	userCode := strings.TrimSpace(flow.UserCode)
 	py := findDeviceAuthPython()
 	script := findDeviceAuthScript()
@@ -120,6 +120,12 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 	}
 	args = append(args, "--token-url", tokURL)
 	args = append(args, "--client-id", ClientID)
+	if em := strings.TrimSpace(email); em != "" {
+		args = append(args, "--email", em)
+	}
+	if pw := strings.TrimSpace(password); pw != "" {
+		args = append(args, "--password", pw)
+	}
 	if strings.TrimSpace(c.proxy) != "" {
 		args = append(args, "--proxy", strings.TrimSpace(c.proxy))
 	}
@@ -205,11 +211,12 @@ func (c *Client) confirmViaPlaywright(ctx context.Context, sso, verifyURL string
 		}
 		return fmt.Errorf("device_auth: no ok in stdout (%s)", trimLoc(out+" "+errText))
 	}
-	if !strings.Contains(errText, "v7-hydrate-token") &&
+	if !strings.Contains(errText, "v8-session-bind") &&
+		!strings.Contains(errText, "v7-hydrate-token") &&
 		!strings.Contains(errText, "v6-explicit-approve") &&
 		!strings.Contains(errText, "v5-no-reapprove") &&
 		!strings.Contains(errText, "v4-no-deny") {
-		c.log("device_auth warning: script missing v7 banner (stale image?)")
+		c.log("device_auth warning: script missing v8 banner (stale image?)")
 	}
 	if strings.Contains(errText, "ui_done_no_token") || strings.Contains(errText, "api_bound_no_token") {
 		c.log("device_auth UI done but token missing — will probe/fail hard")
@@ -545,7 +552,8 @@ const deviceClickJS = `(function(){
   }
   function isAllow(label){
     const low = (label || "").toLowerCase();
-    const good = ["allow","authorize","approve","accept","grant"];
+    if (low.indexOf("cookie")>=0 || low.indexOf("accept all")>=0) return false;
+    const good = ["allow","authorize","approve","grant"];
     for (var i=0;i<good.length;i++){ if (low===good[i] || low.indexOf(good[i])>=0) return true; }
     return false;
   }
