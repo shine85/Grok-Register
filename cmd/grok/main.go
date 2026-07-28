@@ -636,7 +636,7 @@ func cmdLogs(args []string) error {
 	var offset int64
 	if fi, err := os.Stat(path); err == nil {
 		// show last ~8k then filter (more room when DBG hidden)
-		chunk := int64(8192)
+		chunk := int64(64 << 10) /* 64KiB so long runs still show mint/oauth */
 		if minLevel <= logx.LevelDebug {
 			chunk = 16384
 		}

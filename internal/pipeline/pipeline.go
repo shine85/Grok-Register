@@ -642,27 +642,37 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 	log := e.opt.Log
 	pageURL := protocol.SiteURL + "/sign-up"
 	for {
-		if e.remainingCapacity() <= 0 && int(e.done.Load()) >= e.opt.Target {
+		if int(e.done.Load()) >= e.opt.Target {
 			return
 		}
-		// Don't mint far ahead of what we still need.
-		if e.remainingCapacity() <= 0 {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Token demand:
+		// - remainingCapacity() future seats (not yet reserved)
+		// - qDepth emails already reserved & waiting in Q for a token
+		// BUGFIX: P reserves before S mints → remainingCapacity==0 while qDepth>0.
+		// Old code refused to mint in that state → Q sat 8m and expired (looked "stuck").
+		tDepth, qDepth := e.inv.Depths()
+		// qDepth: emails waiting on token. remainingCapacity: not yet reserved.
+		// Speculative +1 while T empty keeps S ahead of P (P may hold reserved
+		// during CreateEmail/PollCode before PutQ — qDepth still 0).
+		want := e.remainingCapacity() + qDepth
+		if want < 1 && tDepth < 1 && int(e.done.Load()) < e.opt.Target {
+			want = 1
+		}
+		if want < 1 {
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(500 * time.Millisecond):
 			}
-			if int(e.done.Load()) >= e.opt.Target {
-				return
-			}
 			continue
 		}
-		tDepth, _ := e.inv.Depths()
-		need := e.remainingCapacity()
-		if need < 1 {
-			need = 1
-		}
-		if tDepth >= need {
+		if tDepth >= want {
 			select {
 			case <-ctx.Done():
 				return
@@ -670,15 +680,11 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 			}
 			continue
 		}
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+
 		if err := e.phys.Acquire(ctx); err != nil {
 			return
 		}
-		log.Infof("[S%d] turnstile mint start...", id)
+		log.Infof("[S%d] turnstile mint start... want=%d t=%d q=%d reserved=%d", id, want, tDepth, qDepth, e.reserved.Load())
 		tok, err := e.turn.Solve(ctx, scfg.SiteKey, pageURL)
 		e.phys.Release()
 		if err != nil {
@@ -693,7 +699,7 @@ func (e *Engine) sWorker(ctx context.Context, id int, scfg protocol.SignupConfig
 		if err := e.inv.PutT(ctx, tok, 5*time.Minute); err != nil {
 			return
 		}
-		log.Infof("[S%d] token ok (len=%d)", id, len(tok))
+		log.Infof("[S%d] token ok (len=%d) t/q after mint will serve C", id, len(tok))
 	}
 }
 
